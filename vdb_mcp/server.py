@@ -37,6 +37,13 @@ logging.basicConfig(level=os.environ.get("VDB_LOG_LEVEL", "INFO"))
 API_URL = os.environ.get("VDB_API_URL", "https://vdb.ai.kr").rstrip("/")
 API_TOKEN = os.environ.get("VDB_API_TOKEN", "")
 
+# Self-reported client label for VDB's admin traffic breakdown (X-VDB-Client).
+# Defaults to "vdb-mcp" for the local `uvx vdb-mcp` path; the hosted remote
+# endpoint's container overrides VDB_CLIENT=vdb-mcp-remote so the two show up
+# as distinct distribution channels in the dashboard.
+CLIENT_TAG = os.environ.get("VDB_CLIENT", "vdb-mcp")
+_UA = f"vdb-mcp/{__version__}"
+
 # version= flows into serverInfo for ALL transports — without it the
 # streamable-http path reports the mcp SDK version instead of ours.
 server = Server("vdb", version=__version__)
@@ -60,7 +67,9 @@ def _resolved() -> tuple[str, str]:
 
 def _headers() -> dict[str, str]:
     _, token = _resolved()
-    h = {"Accept": "application/json"}
+    # X-VDB-Client + a real User-Agent so this traffic is attributable to the
+    # MCP channel in the admin dashboard even if a proxy strips one of them.
+    h = {"Accept": "application/json", "X-VDB-Client": CLIENT_TAG, "User-Agent": _UA}
     if token:
         h["Authorization"] = f"Bearer {token}"
     return h

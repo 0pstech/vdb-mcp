@@ -344,7 +344,12 @@ async def main_http() -> None:
         finally:
             _request_cfg.reset(tok)
 
-    app = Starlette(routes=[Mount("/mcp", app=handle)])
+    # Mount at root, not at "/mcp": Starlette's Mount("/mcp") 307-redirects
+    # a bare "/mcp" to "/mcp/", which behind a trailing-slash-normalizing
+    # proxy (our Caddy) becomes an infinite redirect loop. The session
+    # manager keys on the JSON-RPC body, not the path, so serving every
+    # path is fine — Caddy only ever routes /mcp* here anyway.
+    app = Starlette(routes=[Mount("/", app=handle)])
     # Browser-based MCP clients need CORS; expose the session header.
     app = CORSMiddleware(
         app,

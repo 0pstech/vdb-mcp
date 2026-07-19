@@ -24,6 +24,17 @@ Claude Desktop (`claude_desktop_config.json`) / Cursor (`.cursor/mcp.json`):
 }
 ```
 
+**No install at all** — point any streamable-HTTP MCP client at the hosted
+endpoint:
+
+```json
+{
+  "mcpServers": {
+    "vdb": { "url": "https://vdb.ai.kr/mcp" }
+  }
+}
+```
+
 That's it — the server talks to the hosted instance at `https://vdb.ai.kr`
 by default. Anonymous use gets a free per-IP trial; add an API key for
 unmetered access (free at <https://vdb.ai.kr/signup>):

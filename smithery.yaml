@@ -1,0 +1,30 @@
+# Smithery.ai registry config for the VDB MCP server.
+# Docs: https://smithery.ai/docs — validate against their current schema
+# before submitting; this file targets the container runtime.
+startCommand:
+  type: stdio
+  configSchema:
+    type: object
+    properties:
+      vdbApiUrl:
+        type: string
+        title: VDB instance URL
+        description: Origin of the VDB instance to query. Leave default for the hosted service.
+        default: https://vdb.ai.kr
+      vdbApiToken:
+        type: string
+        title: VDB API key (optional)
+        description: vdb_… key for unmetered per-account access. Free at https://vdb.ai.kr/signup. Anonymous use gets a per-IP trial.
+  commandFunction: |-
+    (config) => ({
+      command: "python",
+      args: ["-m", "vdb_mcp.server"],
+      env: {
+        VDB_API_URL: config.vdbApiUrl || "https://vdb.ai.kr",
+        ...(config.vdbApiToken ? { VDB_API_TOKEN: config.vdbApiToken } : {}),
+        MCP_MODE: "stdio"
+      }
+    })
+build:
+  dockerfile: Dockerfile
+  dockerBuildPath: .

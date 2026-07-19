@@ -1,0 +1,36 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-09-29/server.schema.json",
+  "name": "kr.ai.vdb/vdb",
+  "description": "Check packages for CVEs, slopsquatting, and CISA KEV before your AI agent installs them.",
+  "repository": {
+    "url": "https://github.com/0pstech/vdb-mcp",
+    "source": "github"
+  },
+  "version": "0.1.1",
+  "websiteUrl": "https://vdb.ai.kr",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "vdb-mcp",
+      "version": "0.1.1",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "VDB_API_URL",
+          "description": "VDB instance origin. Defaults to the hosted https://vdb.ai.kr.",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "VDB_API_TOKEN",
+          "description": "Optional vdb_… API key for unmetered per-account access (free at https://vdb.ai.kr/signup). Anonymous use gets a per-IP trial.",
+          "isRequired": false,
+          "isSecret": true
+        }
+      ]
+    }
+  ]
+}

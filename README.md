@@ -1,7 +1,4 @@
 # vdb-mcp
-<<<<<<< HEAD
-mcp for vdb
-=======
 
 mcp-name: kr.ai.vdb/vdb
 
@@ -79,4 +76,3 @@ restrictions: you may not offer this software to third parties as a hosted
 or managed service, or resell it as a product. Commercial licensing beyond
 that: <dev@egdee.com>. API usage is governed by the VDB service terms
 regardless of how you call it.
->>>>>>> 0d5f3f3 (v0.1.1 — VDB MCP server (public release mirror))

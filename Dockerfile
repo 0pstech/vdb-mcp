@@ -25,8 +25,9 @@ RUN pip install --no-cache-dir "mcp>=1.0.0" "httpx>=0.27.0"
 
 COPY vdb_mcp /app/vdb_mcp
 
-ENV VDB_API_URL=http://api:8080 \
-    MCP_MODE=stdio \
+# Default to the public instance — Smithery/standalone runs need it.
+# docker-compose overrides VDB_API_URL/MCP_MODE explicitly for in-cluster use.
+ENV VDB_API_URL=https://vdb.ai.kr \
     MCP_PORT=7700
 
 ENTRYPOINT ["/usr/bin/tini", "--"]

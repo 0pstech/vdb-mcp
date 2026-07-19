@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vdb-mcp"
-version = "0.1.1"
+version = "0.1.2"
 description = "MCP server for VDB — AI-aware vulnerability database (packages, MCP servers, models). Check packages for CVEs and slopsquatting before installing."
 readme = "README.md"
 requires-python = ">=3.10"

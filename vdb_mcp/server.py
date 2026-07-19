@@ -6,12 +6,16 @@ to check packages, scan SBOMs, and look up vulnerabilities.
 
 Modes:
     stdio  (default)  spawned by the client as a subprocess. JSON-RPC on stdio.
-    sse                long-running HTTP server on $MCP_PORT.
+    http               streamable HTTP at /mcp on $PORT — the transport
+                       Smithery hosting and remote MCP clients expect.
+                       Auto-selected when $PORT is set and MCP_MODE isn't.
+    sse                legacy SSE server on $MCP_PORT (docker-compose profile).
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -33,27 +37,48 @@ logging.basicConfig(level=os.environ.get("VDB_LOG_LEVEL", "INFO"))
 API_URL = os.environ.get("VDB_API_URL", "https://vdb.ai.kr").rstrip("/")
 API_TOKEN = os.environ.get("VDB_API_TOKEN", "")
 
-server = Server("vdb")
+# version= flows into serverInfo for ALL transports — without it the
+# streamable-http path reports the mcp SDK version instead of ours.
+server = Server("vdb", version=__version__)
+
+# Per-request session config (http mode). Smithery-hosted deployments pass
+# the user's config as query parameters on every /mcp request; the ASGI
+# wrapper stashes them here so concurrent sessions with different tokens
+# don't clobber each other. Empty in stdio/sse modes → env defaults apply.
+_request_cfg: contextvars.ContextVar[dict] = contextvars.ContextVar(
+    "vdb_request_cfg", default={}
+)
+
+
+def _resolved() -> tuple[str, str]:
+    """(api_url, token) for the CURRENT request: session config > env."""
+    cfg = _request_cfg.get()
+    url = (cfg.get("vdbApiUrl") or API_URL).rstrip("/")
+    token = cfg.get("vdbApiToken") or API_TOKEN
+    return url, token
 
 
 def _headers() -> dict[str, str]:
+    _, token = _resolved()
     h = {"Accept": "application/json"}
-    if API_TOKEN:
-        h["Authorization"] = f"Bearer {API_TOKEN}"
+    if token:
+        h["Authorization"] = f"Bearer {token}"
     return h
 
 
 async def _get(path: str, params: dict | None = None) -> Any:
+    url, _ = _resolved()
     async with httpx.AsyncClient(timeout=15) as c:
-        r = await c.get(f"{API_URL}{path}", params=params, headers=_headers())
+        r = await c.get(f"{url}{path}", params=params, headers=_headers())
         r.raise_for_status()
         return r.json()
 
 
 async def _post(path: str, body: dict) -> Any:
+    url, _ = _resolved()
     async with httpx.AsyncClient(timeout=30) as c:
         r = await c.post(
-            f"{API_URL}{path}",
+            f"{url}{path}",
             json=body,
             headers={**_headers(), "Content-Type": "application/json"},
         )
@@ -290,9 +315,59 @@ async def main_sse() -> None:
     await uvicorn.Server(config).serve()
 
 
+async def main_http() -> None:
+    """Streamable HTTP at /mcp — what Smithery hosting and remote MCP
+    clients speak. Listens on $PORT (Smithery sets 8081), falls back to
+    $MCP_PORT/7700 for manual runs. Stateless: each request carries its
+    own session config as query parameters."""
+    from urllib.parse import parse_qs
+
+    import uvicorn
+    from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+    from starlette.applications import Starlette
+    from starlette.middleware.cors import CORSMiddleware
+    from starlette.routing import Mount
+
+    port = int(os.environ.get("PORT", os.environ.get("MCP_PORT", "7700")))
+    session_manager = StreamableHTTPSessionManager(app=server, stateless=True)
+
+    async def handle(scope, receive, send):
+        # Stash per-request config (Smithery passes user config as query
+        # params) so tool calls resolve the right API URL/token.
+        cfg = {}
+        if scope.get("type") == "http":
+            qs = parse_qs((scope.get("query_string") or b"").decode())
+            cfg = {k: v[0] for k, v in qs.items() if v}
+        tok = _request_cfg.set(cfg)
+        try:
+            await session_manager.handle_request(scope, receive, send)
+        finally:
+            _request_cfg.reset(tok)
+
+    app = Starlette(routes=[Mount("/mcp", app=handle)])
+    # Browser-based MCP clients need CORS; expose the session header.
+    app = CORSMiddleware(
+        app,
+        allow_origins=["*"],
+        allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+        allow_headers=["*"],
+        expose_headers=["mcp-session-id", "mcp-protocol-version"],
+    )
+    log.info("vdb-mcp serving streamable HTTP at 0.0.0.0:%d /mcp", port)
+    async with session_manager.run():
+        config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
+        await uvicorn.Server(config).serve()
+
+
 def main() -> None:
-    mode = os.environ.get("MCP_MODE", "stdio")
-    if mode == "sse":
+    mode = os.environ.get("MCP_MODE", "").lower()
+    if not mode:
+        # Smithery (and most container hosts) inject PORT and expect an
+        # HTTP server; a plain `vdb-mcp` launch stays stdio.
+        mode = "http" if os.environ.get("PORT") else "stdio"
+    if mode == "http":
+        asyncio.run(main_http())
+    elif mode == "sse":
         asyncio.run(main_sse())
     else:
         asyncio.run(main_stdio())

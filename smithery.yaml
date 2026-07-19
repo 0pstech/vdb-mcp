@@ -1,8 +1,16 @@
-# Smithery.ai registry config for the VDB MCP server.
-# Docs: https://smithery.ai/docs — validate against their current schema
-# before submitting; this file targets the container runtime.
+# Smithery hosted deployment config.
+# Docs: https://smithery.ai/docs/build/deployments/custom-container
+#
+# runtime "container": Smithery builds the Dockerfile and runs it with
+# PORT=8081; the container must serve streamable HTTP at /mcp (implemented
+# in vdb_mcp.server.main_http — auto-selected when PORT is set). User
+# session config below arrives as query parameters on /mcp requests.
+runtime: "container"
+build:
+  dockerfile: "Dockerfile"
+  dockerBuildPath: "."
 startCommand:
-  type: stdio
+  type: "http"
   configSchema:
     type: object
     properties:
@@ -14,17 +22,6 @@ startCommand:
       vdbApiToken:
         type: string
         title: VDB API key (optional)
-        description: vdb_… key for unmetered per-account access. Free at https://vdb.ai.kr/signup. Anonymous use gets a per-IP trial.
-  commandFunction: |-
-    (config) => ({
-      command: "python",
-      args: ["-m", "vdb_mcp.server"],
-      env: {
-        VDB_API_URL: config.vdbApiUrl || "https://vdb.ai.kr",
-        ...(config.vdbApiToken ? { VDB_API_TOKEN: config.vdbApiToken } : {}),
-        MCP_MODE: "stdio"
-      }
-    })
-build:
-  dockerfile: Dockerfile
-  dockerBuildPath: .
+        description: vdb_… key for unmetered per-account access. Free at https://vdb.ai.kr/signup. Without it, calls share the host's anonymous per-IP trial.
+  exampleConfig:
+    vdbApiUrl: https://vdb.ai.kr

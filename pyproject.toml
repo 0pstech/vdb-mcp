@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vdb-mcp"
-version = "0.1.2"
+version = "0.2.0"
 description = "MCP server for VDB — AI-aware vulnerability database (packages, MCP servers, models). Check packages for CVEs and slopsquatting before installing."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -23,7 +23,16 @@ classifiers = [
 ]
 dependencies = [
     # `mcp` pulls starlette/uvicorn needed by the optional SSE mode.
-    "mcp>=1.0.0",
+    #
+    # PINNED BELOW 2 ON PURPOSE. The SDK's 2.0 release removed the
+    # decorator-based low-level API this server is written against
+    # (`@server.list_tools()` / `@server.call_tool()`) in favour of a new
+    # MCPServer class. With an open `>=1.0.0` range, a fresh `uvx vdb-mcp`
+    # resolved mcp 2.x and died at import with AttributeError before serving
+    # a single request — silently, since the client just sees a server that
+    # won't start. Migrating to the 2.x API is its own piece of work; until
+    # then this bound is what keeps the published package usable.
+    "mcp>=1.0.0,<2",
     "httpx>=0.27.0",
 ]
 

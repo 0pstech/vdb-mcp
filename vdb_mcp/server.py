@@ -44,6 +44,18 @@ API_TOKEN = os.environ.get("VDB_API_TOKEN", "")
 CLIENT_TAG = os.environ.get("VDB_CLIENT", "vdb-mcp")
 _UA = f"vdb-mcp/{__version__}"
 
+# Local mode = the server process runs on the developer's own machine (stdio,
+# i.e. `uvx vdb-mcp`). Only there can a file path mean the caller's file, and
+# only there can we abstract source without it leaving the host. On the hosted
+# remote endpoint the paths would be OURS, and shipping source to us would
+# break the exact privacy promise the harden feature is built on — so the tool
+# is not offered at all rather than offered in a degraded form.
+def _is_local() -> bool:
+    mode = os.environ.get("MCP_MODE", "").lower()
+    if mode:
+        return mode == "stdio"
+    return not os.environ.get("PORT")
+
 # version= flows into serverInfo for ALL transports — without it the
 # streamable-http path reports the mcp SDK version instead of ours.
 server = Server("vdb", version=__version__)
@@ -95,6 +107,23 @@ async def _post(path: str, body: dict) -> Any:
         return r.json()
 
 
+async def _post_file(path: str, filename: str, content: bytes) -> Any:
+    url, _ = _resolved()
+    async with httpx.AsyncClient(timeout=60) as c:
+        r = await c.post(
+            f"{url}{path}",
+            files={"file": (filename, content)},
+            headers=_headers(),
+        )
+        r.raise_for_status()
+        return r.json()
+
+
+def _json(payload: Any) -> list[TextContent]:
+    return [TextContent(type="text",
+                        text=json.dumps(payload, indent=2, ensure_ascii=False))]
+
+
 # ── Tool list ────────────────────────────────────────────────────────────────
 
 @server.list_tools()
@@ -103,9 +132,12 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="vdb_check_package",
             description=(
-                "BEFORE recommending or installing any package, call this to check the package "
-                "against the VDB vulnerability and slopsquatting database. Returns known "
-                "vulnerabilities, slop risk, KEV status, and severity buckets."
+                "BEFORE recommending or installing any package, check it here. "
+                "The response carries `agent_action`: REFUSE (do not add it — "
+                "relay the `because` text to the user), CONFIRM (ask the user "
+                "first), or PROCEED. A failed or rate-limited call also answers "
+                "REFUSE; never proceed unchecked. Also returns the underlying "
+                "advisories, slop risk, and KEV status as supporting data."
             ),
             inputSchema={
                 "type": "object",
@@ -125,9 +157,12 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="vdb_check_packages",
             description=(
-                "Bulk-check multiple package names for slopsquatting risk. Use this when an "
-                "LLM-generated response references multiple packages — it's faster than calling "
-                "vdb_check_package per item."
+                "Bulk-check several packages in one call — always prefer this "
+                "over repeated vdb_check_package. Each result carries its own "
+                "`agent_action` (REFUSE / CONFIRM / PROCEED) plus a top-level "
+                "`agent_action` for the batch. Follow them; relay `because` "
+                "when refusing. Send names EXACTLY as written — do not correct "
+                "a typo first, the call is the typo test."
             ),
             inputSchema={
                 "type": "object",
@@ -138,6 +173,28 @@ async def list_tools() -> list[Tool]:
                         "items": {"type": "string"},
                         "description": "List of PURLs or 'ecosystem/name' shorthand.",
                     }
+                },
+            },
+        ),
+        Tool(
+            name="vdb_scan_lockfile",
+            description=(
+                "BEFORE merging, scan the resolved lockfile. Checking the "
+                "packages someone chose misses the transitive ones nobody "
+                "did — which is usually where the risk is. Pass the file "
+                "contents (package-lock.json, requirements.txt, uv.lock, "
+                "go.sum, Cargo.lock, a CycloneDX SBOM, …). Returns "
+                "`agent_action`: REFUSE means do not merge."
+            ),
+            inputSchema={
+                "type": "object",
+                "required": ["filename"],
+                "properties": {
+                    "filename": {"type": "string",
+                                 "description": "e.g. 'package-lock.json' — the format is detected from it"},
+                    "content":  {"type": "string", "description": "The file's text."},
+                    "path":     {"type": "string",
+                                 "description": "Local runs only (uvx vdb-mcp): read the file here instead of passing content."},
                 },
             },
         ),
@@ -165,8 +222,11 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="vdb_check_mcp_server",
             description=(
-                "BEFORE recommending the user install a community/unofficial MCP server, "
-                "call this to look up its declared scopes, trust tier, and known risk profile."
+                "BEFORE recommending a community/unofficial MCP server, check "
+                "it here. Scope risk is evaluated independently of advisory "
+                "risk — an unvetted publisher asking for shell or filesystem "
+                "access is refused even with a clean record. Follow the "
+                "returned `agent_action`."
             ),
             inputSchema={
                 "type": "object",
@@ -185,38 +245,132 @@ async def list_tools() -> list[Tool]:
                 },
             },
         ),
-    ]
+    ] + ([
+        Tool(
+            name="vdb_harden",
+            description=(
+                "Decide whether attacker-controlled data can reach a dangerous "
+                "operation through this file's transitive dependencies — with "
+                "no CVE required. Use it on code that passes user input into a "
+                "third-party API. The file is abstracted LOCALLY first "
+                "(identifiers renamed, literals reduced to shapes, bodies "
+                "dropped); only that abstraction and the lockfile are sent, "
+                "never source text. Returns decided paths, a call-site fix "
+                "that does not modify the dependency, and the residual risk "
+                "the fix does not cover."
+            ),
+            inputSchema={
+                "type": "object",
+                "required": ["path", "manifest_path"],
+                "properties": {
+                    "path": {"type": "string",
+                             "description": "Python file to analyze."},
+                    "manifest_path": {"type": "string",
+                                      "description": "uv.lock / poetry.lock / Pipfile.lock / requirements.txt / CycloneDX. Version ranges cannot be analyzed — the answer differs per resolved version."},
+                },
+            },
+        ),
+        Tool(
+            name="vdb_harden_verify",
+            description=(
+                "After applying a fix returned by vdb_harden, re-abstract the "
+                "local file and verify the originally issued path. Returns a "
+                "signed evidence payload bound to the original analysis, the "
+                "fixed IR fingerprint, and the dependency graph. This proves "
+                "VDB's decision over the submitted abstraction, not that the "
+                "abstraction matches a deployed binary."
+            ),
+            inputSchema={
+                "type": "object",
+                "required": ["path", "manifest_path", "path_id"],
+                "properties": {
+                    "path": {"type": "string", "description": "Fixed Python file."},
+                    "manifest_path": {"type": "string", "description": "The same resolved manifest used for vdb_harden."},
+                    "path_id": {"type": "string", "description": "Path id issued by vdb_harden."},
+                },
+            },
+        ),
+        Tool(
+            name="vdb_vex",
+            description=(
+                "Given a project directory and its lockfile, work out which of "
+                "its known advisories can actually be reached by "
+                "attacker-controlled data, and return an OpenVEX document plus "
+                "a shareable URL. Use this when a scan produced more findings "
+                "than anyone can triage. Point `path` at the SOURCE TREE, not "
+                "one file: a not_affected determination is only as wide as the "
+                "code behind it, and a single-file run withholds them all. "
+                "Reachability is decided at package granularity from static "
+                "summaries — good for triage order, not proof of "
+                "non-exploitability."
+            ),
+            inputSchema={
+                "type": "object",
+                "required": ["path", "manifest_path"],
+                "properties": {
+                    "path": {"type": "string",
+                             "description": "Project source directory."},
+                    "manifest_path": {"type": "string",
+                                      "description": "Resolved lockfile for the same project."},
+                },
+            },
+        ),
+    ] if _is_local() else [])
 
 
 # ── Tool dispatch ───────────────────────────────────────────────────────────
 
 async def _tool_check_package(args: dict) -> list[TextContent]:
+    """One package, same gate as the bulk tool.
+
+    This used to call /v1/query, which returns raw advisories and no verdict.
+    An agent then had to re-derive the policy itself — the exact thing the
+    decision layer exists to stop — and the two tools disagreed about what a
+    check even means. Both go through /v1/ai/check-packages now.
+    """
     purl = args["purl"]
     version = args.get("version")
-    data = await _post("/v1/query", {"package": {"purl": purl}, "version": version})
-    vulns = data.get("vulns") or []
-    summary = {
-        "purl": purl,
-        "version": version,
-        "vulnerabilities_found": len(vulns),
-        "top": [
-            {
-                "id": v.get("id"),
-                "summary": v.get("summary"),
-                "severity": (v.get("database_specific") or {}).get("severity"),
-                "slop_risk": ((v.get("vdb_signals") or {}).get("ai_context") or {})
-                              .get("slopsquatting", {}).get("risk"),
-            }
-            for v in vulns[:10]
-        ],
-    }
-    return [TextContent(type="text", text=json.dumps(summary, indent=2, ensure_ascii=False))]
+    if version and "@" not in purl.rsplit("/", 1)[-1]:
+        purl = f"{purl}@{version}"
+    data = await _post("/v1/ai/check-packages", {"packages": [purl]})
+    results = data.get("results") or []
+    return _json(results[0] if len(results) == 1 else data)
 
 
 async def _tool_check_packages(args: dict) -> list[TextContent]:
     pkgs = args["packages"]
     data = await _post("/v1/ai/check-packages", {"packages": pkgs})
-    return [TextContent(type="text", text=json.dumps(data, indent=2, ensure_ascii=False))]
+    return _json(data)
+
+
+async def _tool_scan_lockfile(args: dict) -> list[TextContent]:
+    """The merge gate. Direct checks miss transitives; this is the only tool
+    that sees the dependency nobody chose."""
+    filename = args.get("filename") or ""
+    content = args.get("content")
+    path = args.get("path")
+    if content is None and path:
+        # Only meaningful in stdio mode, where the server runs on the machine
+        # that owns the file. In hosted mode the path is ours, not theirs, so
+        # the agent must pass `content` instead.
+        with open(path, "rb") as fh:
+            content = fh.read().decode("utf-8", "replace")
+        filename = filename or os.path.basename(path)
+    if content is None:
+        return _json({"error": "pass either `content` or (in local mode) `path`"})
+    data = await _post_file("/v1/sbom/scan", filename or "lockfile.txt",
+                            content.encode())
+    # Findings can run to hundreds; the verdict and the worst offenders are
+    # what a merge decision needs. The full list stays one API call away.
+    return _json({
+        "agent_action":      data.get("agent_action"),
+        "because":           data.get("because"),
+        "sbom_format":       data.get("sbom_format"),
+        "components_total":  data.get("components_total"),
+        "summary":           data.get("summary"),
+        "top_findings":      (data.get("vulnerabilities") or [])[:20],
+        "findings_total":    len(data.get("vulnerabilities") or []),
+    })
 
 
 async def _tool_lookup(args: dict) -> list[TextContent]:
@@ -239,8 +393,17 @@ async def _tool_search(args: dict) -> list[TextContent]:
 
 
 async def _tool_check_mcp_server(args: dict) -> list[TextContent]:
-    data = await _get(f"/v1/ai/mcp-servers/{args['server_id']}")
-    return [TextContent(type="text", text=json.dumps(data, indent=2, ensure_ascii=False))]
+    """Routed through the gate so scope risk produces a verdict, not a record.
+
+    An MCP server VDB has no record of returns REFUSE rather than CONFIRM —
+    installing one grants it tool access, so unverifiable is not acceptable
+    here the way it is for an ordinary library.
+    """
+    sid = args["server_id"]
+    purl = sid if sid.startswith("pkg:mcp/") else f"pkg:mcp/{sid.removeprefix('mcp:')}"
+    data = await _post("/v1/ai/check-packages", {"packages": [purl]})
+    results = data.get("results") or []
+    return _json(results[0] if len(results) == 1 else data)
 
 
 async def _tool_list_slop(args: dict) -> list[TextContent]:
@@ -251,9 +414,118 @@ async def _tool_list_slop(args: dict) -> list[TextContent]:
     return [TextContent(type="text", text=json.dumps(data, indent=2, ensure_ascii=False))]
 
 
+async def _tool_harden(args: dict) -> list[TextContent]:
+    """Abstract locally, then send only the abstraction.
+
+    The import is deliberately inside the function: the vendored modules are
+    pure stdlib, but keeping them off the hosted server's import path makes
+    the local-only boundary structural rather than a matter of remembering.
+    """
+    from .harden.ir import build_ir_from_file
+
+    path = args["path"]
+    manifest_path = args["manifest_path"]
+    ir = build_ir_from_file(path)
+    if not ir.callsites:
+        return _json({
+            "paths": [],
+            "note": "no third-party call sites found in this file — nothing to "
+                    "decide. Point it at code that passes input into a "
+                    "dependency's API.",
+        })
+    with open(manifest_path, "rb") as fh:
+        manifest = fh.read().decode("utf-8", "replace")
+    data = await _post("/v1/harden/analyze", {
+        "ir": ir.to_dict(),
+        "manifest": manifest,
+        "manifest_filename": os.path.basename(manifest_path),
+    })
+    return _json({
+        "paths":      data.get("paths"),
+        "hardenings": data.get("hardenings"),
+        "cached":     data.get("cached"),
+        "analysis_complete": data.get("analysis_complete"),
+        "summaries_missing": data.get("summaries_missing"),
+        "analysis_notes": data.get("notes"),
+        "note": ("Analysis is incomplete; an empty path list is not a safety "
+                 "determination. Re-run after summaries are available."
+                 if data.get("incomplete") else
+                 "Paths are decided from the dependency graph, independently "
+                 "of whether any CVE exists. Apply the fix at the CALL SITE — "
+                 "the dependency is never modified. Verify the issued path "
+                 "with vdb_harden_verify after applying it."),
+    })
+
+
+async def _tool_harden_verify(args: dict) -> list[TextContent]:
+    """Re-abstract a fixed local file and verify an issued path."""
+    from .harden.ir import build_ir_from_file
+
+    path = args["path"]
+    manifest_path = args["manifest_path"]
+    ir = build_ir_from_file(path)
+    with open(manifest_path, "rb") as fh:
+        manifest = fh.read().decode("utf-8", "replace")
+    data = await _post("/v1/harden/verify", {
+        "ir": ir.to_dict(),
+        "manifest": manifest,
+        "manifest_filename": os.path.basename(manifest_path),
+        "path_id": args["path_id"],
+    })
+    return _json(data)
+
+
+async def _tool_vex(args: dict) -> list[TextContent]:
+    """Scan, then subtract. Local-only for the same reason as vdb_harden —
+    the abstraction runs on the machine that owns the source."""
+    from .harden.ir import build_ir_from_tree
+
+    path = args["path"]
+    manifest_path = args["manifest_path"]
+    if not os.path.isdir(path):
+        return _json({"error": "path must be a directory — a not_affected "
+                               "determination derived from one file would be "
+                               "wrong for every other file that imports the "
+                               "same package"})
+    ir = build_ir_from_tree(path)
+    if not ir.files:
+        return _json({"error": f"no Python files under {path}"})
+
+    with open(manifest_path, "rb") as fh:
+        manifest = fh.read().decode("utf-8", "replace")
+    scan = await _post_file("/v1/sbom/scan", os.path.basename(manifest_path),
+                            manifest.encode())
+    doc = await _post("/v1/vex", {
+        "ir": ir.to_dict(),
+        "manifest": manifest,
+        "manifest_filename": os.path.basename(manifest_path),
+        "findings": scan.get("vulnerabilities") or [],
+    })
+    meta = doc.get("_vdb", {})
+    # The statements a human still has to act on, plus the scope the whole
+    # thing rests on. The full document is behind share_url; pasting several
+    # hundred statements into the transcript would bury the answer.
+    return _json({
+        "share_url":   meta.get("share_url"),
+        "total":       len(doc.get("statements", [])),
+        "counts":      meta.get("counts", {}),
+        "needs_triage": [
+            {"id": st["vulnerability"]["name"], "product": st["products"][0]["@id"]}
+            for st in doc.get("statements", [])
+            if st.get("status") == "under_investigation"
+        ],
+        "files_analyzed": meta.get("files_analyzed_count"),
+        "scope_note":     meta.get("scope_note"),
+    })
+
+
 _DISPATCH = {
     "vdb_check_package":      _tool_check_package,
     "vdb_check_packages":     _tool_check_packages,
+    "vdb_scan_lockfile":      _tool_scan_lockfile,
+    "vdb_harden":             _tool_harden,
+    "vdb_harden_verify":      _tool_harden_verify,
+    "vdb_vex":                _tool_vex,
     "vdb_lookup":             _tool_lookup,
     "vdb_search":             _tool_search,
     "vdb_check_mcp_server":   _tool_check_mcp_server,
@@ -269,9 +541,30 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     try:
         return await fn(arguments)
     except httpx.HTTPStatusError as e:
-        return [TextContent(type="text", text=f"VDB API error {e.response.status_code}: {e.response.text[:300]}")]
+        # 401/429 bodies carry agent_action=REFUSE plus recovery instructions.
+        # Flattening that into a string would bury the verdict in prose and
+        # leave fail-closed depending on the model reading an error message
+        # carefully — which is exactly the failure mode we removed elsewhere.
+        try:
+            body = e.response.json()
+            detail = body.get("detail", body) if isinstance(body, dict) else body
+        except Exception:  # noqa: BLE001
+            detail = {"message": e.response.text[:400]}
+        if isinstance(detail, dict):
+            detail.setdefault("agent_action", "REFUSE")
+            detail.setdefault("because", "the check did not complete; "
+                                         "proceeding unchecked is not safe")
+        return _json({"http_status": e.response.status_code, **(
+            detail if isinstance(detail, dict) else {"detail": detail})})
     except Exception as e:  # noqa: BLE001
-        return [TextContent(type="text", text=f"error: {e}")]
+        # Transport failures are refusals too — a check that never happened
+        # must never read as a check that passed.
+        return _json({
+            "agent_action": "REFUSE",
+            "because": f"the check could not be completed ({type(e).__name__}); "
+                       f"proceeding unchecked is not safe",
+            "error": str(e)[:300],
+        })
 
 
 # ── Entry point ─────────────────────────────────────────────────────────────

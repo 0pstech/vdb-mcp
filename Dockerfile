@@ -21,7 +21,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-RUN pip install --no-cache-dir "mcp>=1.0.0" "httpx>=0.27.0"
+# See pyproject.toml — mcp 2.x dropped the decorator API this server uses.
+RUN python -m pip install --no-cache-dir --upgrade pip==26.2 \
+    && python -m pip install --no-cache-dir "mcp>=1.0.0,<2" "httpx>=0.27.0"
 
 COPY vdb_mcp /app/vdb_mcp
 

@@ -1,10 +1,12 @@
 [build-system]
-requires = ["hatchling"]
+# <1.32: 1.32 emits Metadata-Version 2.5, which twine (via packaging) does not
+# accept yet — `twine check` fails with "'2.5' is not a valid metadata version".
+requires = ["hatchling<1.32"]
 build-backend = "hatchling.build"
 
 [project]
 name = "vdb-mcp"
-version = "0.2.0"
+version = "0.2.5"
 description = "MCP server for VDB — AI-aware vulnerability database (packages, MCP servers, models). Check packages for CVEs and slopsquatting before installing."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -43,6 +45,9 @@ Repository = "https://github.com/0pstech/vdb-mcp"
 
 [project.scripts]
 vdb-mcp = "vdb_mcp.server:main"
+# `vdb harden ...` is what every document says to type. It has to come from
+# somewhere installable, and this is the package people already install.
+vdb = "vdb_mcp.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["vdb_mcp"]

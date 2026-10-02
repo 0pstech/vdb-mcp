@@ -21,6 +21,8 @@ import logging
 import os
 from typing import Any
 
+import socket
+import urllib.parse
 import httpx
 from mcp.server import NotificationOptions, Server
 from mcp.server.models import InitializationOptions
@@ -77,6 +79,43 @@ def _resolved() -> tuple[str, str]:
     return url, token
 
 
+def _transport_hint() -> str:
+    """Which of network / key / service a transport failure points at.
+
+    An MCP user sees only what the client renders, and `ConnectError` says
+    nothing about whether this machine has DNS, the key is wrong, or VDB is
+    down. Two independent evaluations of VDB stalled on exactly that ambiguity
+    and concluded that detection "could not be assessed at all".
+
+    Timeouts are deliberately short: this runs inside an error path that has
+    already failed once, and must not add a second stall on top of the first.
+    """
+    url, token = _resolved()
+    parts = urllib.parse.urlsplit(url)
+    host = parts.hostname or ""
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    if not host:
+        return "the configured vdbApiUrl is not a valid http(s) URL"
+    try:
+        socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        try:
+            socket.getaddrinfo("pypi.org", 443, type=socket.SOCK_STREAM)
+            return (f"YOUR NETWORK: {host} does not resolve from this machine, "
+                    "though pypi.org does. This is not an auth failure.")
+        except socket.gaierror:
+            return (f"YOUR NETWORK: no working DNS here — {host} and pypi.org "
+                    "both fail to resolve. This is not an auth failure.")
+    try:
+        socket.create_connection((host, port), timeout=3).close()
+    except OSError:
+        return (f"YOUR NETWORK or OUR SERVICE: {host} resolves but port {port} "
+                "refuses or times out. A firewall allowing DNS but blocking "
+                "egress looks exactly like this.")
+    return ("the host is reachable, so this is most likely OUR SERVICE"
+            + ("" if token else "; also, no API token is configured"))
+
+
 def _headers() -> dict[str, str]:
     _, token = _resolved()
     # X-VDB-Client + a real User-Agent so this traffic is attributable to the
@@ -87,36 +126,70 @@ def _headers() -> dict[str, str]:
     return h
 
 
+# Where VDB actually lives, for when this machine's DNS cannot say. Two
+# independent evaluations died at name resolution inside a sandbox with no
+# outbound DNS, and the tool they had been told to delegate to could do
+# nothing about it. Egress to the address is often open even when DNS is not.
+#
+# Used ONLY when resolution fails, and it bypasses DNS and nothing else: the
+# TLS handshake presents the real hostname through httpcore's sni_hostname
+# extension and the certificate is validated against it, so a pinned
+# connection is exactly as authenticated as a resolved one. Override with
+# VDB_API_ADDR (comma-separated) if the service moves before a release.
+FALLBACK_ADDRS: tuple[str, ...] = tuple(
+    a.strip() for a in os.environ.get("VDB_API_ADDR", "144.202.127.83").split(",")
+    if a.strip())
+
+
+def _is_name_failure(exc: BaseException) -> bool:
+    e: BaseException | None = exc
+    while e is not None:
+        if isinstance(e, socket.gaierror):
+            return True
+        e = e.__cause__ or e.__context__
+    return False
+
+
+async def _send(method: str, path: str, *, timeout: float, **kw: Any) -> Any:
+    url, _ = _resolved()
+    parts = urllib.parse.urlsplit(url)
+    async with httpx.AsyncClient(timeout=timeout) as c:
+        try:
+            r = await c.request(method, f"{url}{path}", **kw)
+        except httpx.ConnectError as exc:
+            if parts.scheme != "https" or not _is_name_failure(exc):
+                raise
+            host = parts.hostname or ""
+            portsfx = f":{parts.port}" if parts.port else ""
+            last: BaseException = exc
+            r = None
+            for addr in FALLBACK_ADDRS:
+                pinned = f"https://{addr}{portsfx}{parts.path.rstrip('/')}{path}"
+                hdrs = {**kw.get("headers", {}), "Host": host}
+                try:
+                    r = await c.request(method, pinned, **{**kw, "headers": hdrs},
+                                        extensions={"sni_hostname": host})
+                    break
+                except httpx.ConnectError as exc2:
+                    last = exc2
+            if r is None:
+                raise last
+        r.raise_for_status()
+        return r.json()
+
+
 async def _get(path: str, params: dict | None = None) -> Any:
-    url, _ = _resolved()
-    async with httpx.AsyncClient(timeout=15) as c:
-        r = await c.get(f"{url}{path}", params=params, headers=_headers())
-        r.raise_for_status()
-        return r.json()
+    return await _send("GET", path, timeout=15, params=params, headers=_headers())
 
 
-async def _post(path: str, body: dict) -> Any:
-    url, _ = _resolved()
-    async with httpx.AsyncClient(timeout=30) as c:
-        r = await c.post(
-            f"{url}{path}",
-            json=body,
-            headers={**_headers(), "Content-Type": "application/json"},
-        )
-        r.raise_for_status()
-        return r.json()
+async def _post(path: str, body: dict, timeout: float = 30) -> Any:
+    return await _send("POST", path, timeout=timeout, json=body,
+                       headers={**_headers(), "Content-Type": "application/json"})
 
 
 async def _post_file(path: str, filename: str, content: bytes) -> Any:
-    url, _ = _resolved()
-    async with httpx.AsyncClient(timeout=60) as c:
-        r = await c.post(
-            f"{url}{path}",
-            files={"file": (filename, content)},
-            headers=_headers(),
-        )
-        r.raise_for_status()
-        return r.json()
+    return await _send("POST", path, timeout=60,
+                       files={"file": (filename, content)}, headers=_headers())
 
 
 def _json(payload: Any) -> list[TextContent]:
@@ -312,6 +385,10 @@ async def list_tools() -> list[Tool]:
                              "description": "Project source directory."},
                     "manifest_path": {"type": "string",
                                       "description": "Resolved lockfile for the same project."},
+                    "share": {"type": "boolean", "default": False,
+                              "description": "Also publish the document at a public "
+                                             "URL. Ask the user first — it lists "
+                                             "their components and versions."},
                 },
             },
         ),
@@ -495,11 +572,14 @@ async def _tool_vex(args: dict) -> list[TextContent]:
         manifest = fh.read().decode("utf-8", "replace")
     scan = await _post_file("/v1/sbom/scan", os.path.basename(manifest_path),
                             manifest.encode())
-    doc = await _post("/v1/vex", {
+    # A 30-finding document took the server 60 s on a real project.
+    doc = await _post("/v1/vex", timeout=240, body={
         "ir": ir.to_dict(),
         "manifest": manifest,
         "manifest_filename": os.path.basename(manifest_path),
         "findings": scan.get("vulnerabilities") or [],
+        # Off unless asked: the document lists the project's components.
+        "share": bool(args.get("share", False)),
     })
     meta = doc.get("_vdb", {})
     # The statements a human still has to act on, plus the scope the whole
@@ -563,6 +643,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             "agent_action": "REFUSE",
             "because": f"the check could not be completed ({type(e).__name__}); "
                        f"proceeding unchecked is not safe",
+            "diagnosis": _transport_hint(),
             "error": str(e)[:300],
         })
 
@@ -617,6 +698,30 @@ async def main_sse() -> None:
     await uvicorn.Server(config).serve()
 
 
+def _cfg_from_scope(scope: dict, parse_qs) -> dict:
+    """Per-request config for the hosted endpoint.
+
+    Until 0.2.3 only query parameters were read, so the key a remote client
+    sent as `Authorization: Bearer vdb_...` — the only way `claude mcp add
+    --transport http` can send one — was dropped on the floor, and every tool
+    answered REFUSE/missing_api_key to a caller who had done everything right.
+    Precedence: explicit query config, then the bearer header, then the
+    server's own environment (in `_resolved`).
+    """
+    if scope.get("type") != "http":
+        return {}
+    qs = parse_qs((scope.get("query_string") or b"").decode())
+    cfg = {k: v[0] for k, v in qs.items() if v}
+    if not cfg.get("vdbApiToken"):
+        for name, value in scope.get("headers") or ():
+            if name.lower() == b"authorization":
+                parts = value.decode("latin-1").split(None, 1)
+                if len(parts) == 2 and parts[0].lower() == "bearer" and parts[1].strip():
+                    cfg["vdbApiToken"] = parts[1].strip()
+                break
+    return cfg
+
+
 async def main_http() -> None:
     """Streamable HTTP at /mcp — what Smithery hosting and remote MCP
     clients speak. Listens on $PORT (Smithery sets 8081), falls back to
@@ -634,15 +739,24 @@ async def main_http() -> None:
     session_manager = StreamableHTTPSessionManager(app=server, stateless=True)
 
     async def handle(scope, receive, send):
-        # Stash per-request config (Smithery passes user config as query
-        # params) so tool calls resolve the right API URL/token.
-        cfg = {}
-        if scope.get("type") == "http":
-            qs = parse_qs((scope.get("query_string") or b"").decode())
-            cfg = {k: v[0] for k, v in qs.items() if v}
-        tok = _request_cfg.set(cfg)
+        # Stash per-request config so tool calls resolve the right API
+        # URL/token: Smithery passes user config as query params, and every
+        # other remote client — `claude mcp add --transport http ... --header
+        # "Authorization: Bearer vdb_..."` — sends the key as a bearer header.
+        tok = _request_cfg.set(_cfg_from_scope(scope, parse_qs))
+
+        async def send_stamped(message):
+            # Same X-VDB-Build the API sends, so an /mcp answer names its
+            # build too — a re-test logged "header absent on /mcp".
+            if message.get("type") == "http.response.start":
+                headers = list(message.get("headers") or [])
+                headers.append((b"x-vdb-build",
+                                os.environ.get("VDB_GIT_SHA", "unknown").encode()))
+                message = {**message, "headers": headers}
+            await send(message)
+
         try:
-            await session_manager.handle_request(scope, receive, send)
+            await session_manager.handle_request(scope, receive, send_stamped)
         finally:
             _request_cfg.reset(tok)
 

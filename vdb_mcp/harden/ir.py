@@ -244,6 +244,20 @@ class _Abstractor(ast.NodeVisitor):
                 ops = identify_trusted_wrapper(stmt)
                 if ops:
                     self.local_funcs[stmt.name] = ops
+        # Imports inside function bodies bind the same package. A real project
+        # wrote `from pypdf import PdfReader` inside its extract function, the
+        # module-level pass above never saw it, the IR carried zero pypdf call
+        # sites, and the VEX then declared 47 pypdf advisories not_affected
+        # because "this code cannot call the package at all". It could.
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for a in node.names:
+                    self.imports.setdefault(a.asname or a.name.split(".")[0],
+                                            a.name.split(".")[0])
+            elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+                top = node.module.split(".")[0]
+                for a in node.names:
+                    self.imports.setdefault(a.asname or a.name, top)
 
     # ── 식의 오염 상태 ──────────────────────────────────────────────────
     def taint_of(self, expr: ast.AST) -> tuple[bool, str, list[str], str]:

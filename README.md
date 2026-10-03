@@ -2,6 +2,8 @@
 
 mcp-name: kr.ai.vdb/vdb
 
+[![Wellknown](https://wellknown.network/agents/vdb/badge.svg)](https://wellknown.network/agents/vdb)
+
 MCP (Model Context Protocol) server for **[VDB](https://vdb.ai.kr)** — the
 AI-aware vulnerability database. Lets Claude Desktop, Claude Code, Cursor,
 Cline, Continue, and any MCP client check packages **while generating code**:

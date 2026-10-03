@@ -131,3 +131,5 @@ restrictions: you may not offer this software to third parties as a hosted
 or managed service, or resell it as a product. Commercial licensing beyond
 that: <dev@egdee.com>. API usage is governed by the VDB service terms
 regardless of how you call it.
+
+[![Wellknown](https://wellknown.network/agents/vdb/badge.svg)](https://wellknown.network/agents/vdb)

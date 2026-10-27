@@ -39,6 +39,38 @@ _SOURCE_CALLS = ("input", "sys.argv", "os.environ", "request.args", "request.for
                  "request.headers", "request.cookies", "request.data")
 
 
+# What kind of outside world a source reads from — the threat inference
+# weighs a request argument, a command-line argument and an environment
+# variable differently (JP260065 【0062】), so the IR says which it was.
+_ORIGIN_OF = (
+    ("sys.argv", "argv"),
+    ("os.environ", "env"), ("os.getenv", "env"),
+    ("input", "stdin"),
+)
+
+
+def input_origin(expr: ast.AST) -> str | None:
+    """'request' | 'argv' | 'env' | 'stdin' when the expression reads a known
+    external source, else None."""
+    for n in ast.walk(expr):
+        dotted = ""
+        if isinstance(n, ast.Call):
+            dotted = _dotted(n.func)
+        elif isinstance(n, ast.Subscript):
+            dotted = _dotted(n.value)
+        elif isinstance(n, ast.Attribute):
+            dotted = _dotted(n)
+        if not dotted:
+            continue
+        for p in _SOURCE_CALLS:
+            if dotted == p or dotted.endswith("." + p):
+                for prefix, origin in _ORIGIN_OF:
+                    if p == prefix:
+                        return origin
+                return "request"
+    return None
+
+
 def _reads_external_input(expr: ast.AST) -> bool:
     """Does this expression read one of the known request/environment sources?
 
@@ -182,6 +214,11 @@ class _Abstractor(ast.NodeVisitor):
         self.ir = CodeIR()
         self.symbols: dict[tuple[str, str], str] = {}
         self.tainted: dict[str, str] = {}     # 심볼 → 변형 클래스
+        # 심볼 → 오염 출처(request / argv / env / stdin / param). A value
+        # derived from a parameter is a parameter's worth of threat, not a
+        # request's; without this, every derived value was scored as if an
+        # attacker typed it (JP260065 【0062】).
+        self.origin_of: dict[str, str] = {}
         self.sanitizers_applied: dict[str, list[str]] = {}   # 심볼 → 적용된 연산
         self.imports: dict[str, str] = {}     # alias → 모듈 최상위 이름
         self.module_consts: set[str] = set()
@@ -197,6 +234,9 @@ class _Abstractor(ast.NodeVisitor):
         # this is not an edge case — it is how the libraries are meant to be
         # used.
         self.obj_of: dict[str, tuple[str, str]] = {}
+        # Names the module itself binds (def, class, assignment). A module
+        # that defines its own `eval` is not calling the builtin.
+        self.module_bound: set[str] = set()
         self._n = 0
         self._calls_total = 0
         self._calls_unresolved = 0
@@ -216,6 +256,11 @@ class _Abstractor(ast.NodeVisitor):
     # ── 준비: 모듈 최상위 상수와 지역 함수(정화 후보) 수집 ──────────────
     def prepare(self, tree: ast.Module, src: str) -> None:
         for stmt in tree.body:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                self.module_bound.add(stmt.name)
+            elif isinstance(stmt, ast.Assign):
+                self.module_bound.update(
+                    t.id for t in stmt.targets if isinstance(t, ast.Name))
             if isinstance(stmt, ast.Assign):
                 try:
                     ast.literal_eval(stmt.value)
@@ -308,6 +353,8 @@ class _Abstractor(ast.NodeVisitor):
         old_scope, old_locals = self.scope, self.local_names
         old_tainted, old_sanitizers = self.tainted, self.sanitizers_applied
         old_obj_of = self.obj_of
+        old_origin = self.origin_of
+        self.origin_of = dict(old_origin)
         self.scope = f"fn:{getattr(node, 'lineno', 0)}:{node.name}"
         self.local_names = {
             n.id for n in ast.walk(node)
@@ -316,6 +363,15 @@ class _Abstractor(ast.NodeVisitor):
         self.local_names.update(
             a.arg for a in list(node.args.posonlyargs) + list(node.args.args)
             + list(node.args.kwonlyargs))
+        # Nested def/class and local imports bind names too; without them a
+        # helper named `eval` inside the function read as the builtin.
+        for n in ast.walk(node):
+            if n is not node and isinstance(
+                    n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                self.local_names.add(n.name)
+            elif isinstance(n, (ast.Import, ast.ImportFrom)):
+                self.local_names.update(
+                    (a.asname or a.name).split(".")[0] for a in n.names)
         # Module-level inputs remain visible inside functions, while a local
         # assignment gets its own scoped symbol and therefore shadows them.
         self.tainted = dict(old_tainted)
@@ -331,11 +387,13 @@ class _Abstractor(ast.NodeVisitor):
                 continue
             s = self.sym(a.arg)
             self.tainted[s] = IDENTITY
-            self.ir.sources.append({"symbol": s, "kind": "param"})
+            self.origin_of[s] = "param"
+            self.ir.sources.append({"symbol": s, "kind": "param", "origin": "param"})
         self.generic_visit(node)
         self.scope, self.local_names = old_scope, old_locals
         self.tainted, self.sanitizers_applied = old_tainted, old_sanitizers
         self.obj_of = old_obj_of
+        self.origin_of = old_origin
 
     visit_AsyncFunctionDef = visit_FunctionDef  # type: ignore[assignment]
 
@@ -354,18 +412,32 @@ class _Abstractor(ast.NodeVisitor):
             self._bind_object(t, node.value)
         tainted, transform, sanit, src_sym = self.taint_of(node.value)
         # 명시적 외부 입력도 소스로 승격
-        if _reads_external_input(node.value):
+        explicit = input_origin(node.value)
+        if explicit:
             tainted = True
+        # A derived value inherits the origin of what tainted it; a tainted
+        # expression whose origin cannot be traced is of unknown provenance,
+        # which the specification prices like a parameter.
+        origin = explicit or (self.origin_of.get(src_sym) if src_sym.startswith("v") else None) \
+            or ("param" if tainted else None)
         for t in node.targets:
             if isinstance(t, ast.Name):
                 dst = self.sym(t.id)
                 if tainted:
                     self.tainted[dst] = transform
+                    self.origin_of[dst] = origin or "param"
                     if sanit:
                         self.sanitizers_applied[dst] = sanit
                     source_symbol = src_sym if src_sym.startswith("v") else dst
-                    if not any(s["symbol"] == source_symbol for s in self.ir.sources):
-                        self.ir.sources.append({"symbol": source_symbol, "kind": "input"})
+                    existing = next((s for s in self.ir.sources if s["symbol"] == source_symbol), None)
+                    if existing is None:
+                        self.ir.sources.append({"symbol": source_symbol, "kind": "input",
+                                                "origin": origin or "param"})
+                    elif explicit and existing.get("kind") == "param":
+                        # A parameter that is then read from a request is a
+                        # request source, not an argument of unknown provenance.
+                        existing["kind"], existing["origin"] = "input", explicit
+                        self.origin_of[source_symbol] = explicit
                 else:
                     self.tainted.pop(dst, None)
                     self.sanitizers_applied.pop(dst, None)
@@ -415,6 +487,12 @@ class _Abstractor(ast.NodeVisitor):
         head = dotted.split(".")[0]
         api = dotted.split(".")[-1]
         module = self.imports.get(head)
+        if (module is None and dotted == head and head in _BUILTIN_CALLS
+                and head not in self.local_names and head not in self.module_bound):
+            # eval/exec have no import to attribute them to, so they were
+            # counted as unresolved and never left the machine. The server
+            # judges them under "builtins" with the rest of the stdlib.
+            module = "builtins"
         if module is None and head in self.obj_of:
             # Method on a dependency object. Report it under the class so the
             # summary side can match `requests.Session.get` rather than a bare
@@ -432,13 +510,37 @@ class _Abstractor(ast.NodeVisitor):
             )
             for i, a in enumerate(node.args):
                 t, tf, sn, sym = self.taint_of(a)
-                cs.args.append(CallSiteArg(i, str(i), sym, t, tf, sn))
+                cs.args.append(CallSiteArg(i, str(i), _mode_symbol(a, i == 1) or sym,
+                                           t, tf, sn))
             for k in node.keywords:
                 if k.arg:
                     t, tf, sn, sym = self.taint_of(k.value)
-                    cs.args.append(CallSiteArg(-1, k.arg, sym, t, tf, sn))
+                    cs.args.append(CallSiteArg(-1, k.arg,
+                                               _mode_symbol(k.value, k.arg == "mode") or sym,
+                                               t, tf, sn))
             self.ir.callsites.append(cs)
         self.generic_visit(node)
+
+
+# File-open modes are a closed vocabulary and carry nothing about the user,
+# so they are sent as written instead of masked. The server needs them to
+# tell `ZipFile(upload)` (decompression) from `ZipFile(target, "w")` (not).
+_FILE_MODES = frozenset(
+    m + b for m in ("r", "w", "a", "x", "r+", "w+", "a+") for b in ("", "b", "t")
+) | {f"{d}:{c}" for d in ("r", "w", "a", "x") for c in ("", "*", "gz", "bz2", "xz")} \
+  | {"r|*", "r|gz", "r|bz2", "r|xz", "w|gz", "w|bz2", "w|xz"}
+
+
+def _mode_symbol(node: ast.AST, mode_position: bool) -> str | None:
+    if (mode_position and isinstance(node, ast.Constant)
+            and isinstance(node.value, str) and node.value in _FILE_MODES):
+        return f"MODE<{node.value}>"
+    return None
+
+
+# Builtins worth sending: the ones that ARE the dangerous operation. `open` is
+# left out with the other path operations (see sinks.STDLIB_CALL_SINKS).
+_BUILTIN_CALLS = frozenset({"eval", "exec"})
 
 
 def build_ir(source: str) -> CodeIR:
@@ -467,7 +569,8 @@ _SKIP_DIRS = {".git", ".venv", "venv", "__pycache__", "node_modules", ".tox",
               "site-packages", "tests", "test"}
 
 
-def build_ir_from_tree(root: str, max_files: int = 2000) -> CodeIR:
+def build_ir_from_tree(root: str, max_files: int = 2000,
+                       exclude: tuple[str, ...] = ()) -> CodeIR:
     """Abstract every Python file under `root` into ONE representation.
 
     Per-file analysis cannot support a not_affected claim: "nothing reaches
@@ -485,15 +588,30 @@ def build_ir_from_tree(root: str, max_files: int = 2000) -> CodeIR:
     losses: list[float] = []
     seen_callsite_ids: set[str] = set()
 
+    import fnmatch
+
+    def excluded(rel: str) -> bool:
+        # `--exclude data/backups` or `--exclude "*-evaluation-*"`: matched
+        # against the path relative to the root and against each of its
+        # parts, so a name excludes the directory wherever it sits.
+        parts = rel.split(os.sep)
+        return any(fnmatch.fnmatch(rel, pat) or rel.startswith(pat.rstrip("/") + os.sep)
+                   or rel == pat.rstrip("/") or any(fnmatch.fnmatch(x, pat) for x in parts)
+                   for pat in exclude)
+
     paths: list[str] = []
     total_python_files = 0
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = sorted(
             d for d in dirnames
             if d not in _SKIP_DIRS and not d.startswith(".")
+            and not (exclude and excluded(os.path.relpath(os.path.join(dirpath, d), root)))
         )
         for fn in sorted(filenames):
             if fn.endswith(".py"):
+                # `--exclude "*_test.py"` leaves test modules out wherever they sit.
+                if exclude and excluded(os.path.relpath(os.path.join(dirpath, fn), root)):
+                    continue
                 total_python_files += 1
                 if len(paths) < max_files:
                     paths.append(os.path.join(dirpath, fn))
@@ -545,4 +663,8 @@ def build_ir_from_tree(root: str, max_files: int = 2000) -> CodeIR:
 
     merged.loss = round(sum(losses) / len(losses), 3) if losses else 0.0
     merged.unparsed = unparsed
+    # Local only — to_dict() never carries it, so the server never sees a
+    # path; the CLI uses it to print `app/routes.py:179` instead of `F0055`.
+    merged.local_files = {f"F{i:04d}": os.path.relpath(path, root)
+                          for i, path in enumerate(ordered, start=1)}
     return merged

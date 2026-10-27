@@ -75,6 +75,16 @@ class DepGraph:
     # 여기에 기록한다 — 보수적(경로를 놓치지 않음) 선택이며, 확신도 산출에서
     # 참조할 수 있도록 노출한다.
     ambiguous_names: set[str] = field(default_factory=set)
+    # (dependent node id, dependency name) → the specifier the dependent
+    # declares, where the lockfile records it (uv: requires-dist; poetry:
+    # [package.dependencies]). Not part of graph_hash — the resolved nodes
+    # and edges are what decide a path; this only prices an upgrade.
+    constraints: dict[tuple[str, str], str] = field(default_factory=dict)
+    # Requirements that name a range instead of a version (`fastapi>=0.110`):
+    # node id (the bare name) → the specifier. No summary can be looked up
+    # for them and no advisory decided for them; they stay on the graph so
+    # the answer says so instead of refusing the manifest.
+    unresolved: dict[str, str] = field(default_factory=dict)
 
     # ── 조회 ────────────────────────────────────────────────────────────
     @property
@@ -231,6 +241,10 @@ def parse_uv_lock(raw: bytes) -> DepGraph:
         for dep in p.get("dependencies") or []:
             if isinstance(dep, dict) and dep.get("name"):
                 _link(g, src_id, dep["name"], by_name)
+        meta = p.get("metadata") or {}
+        for req in (meta.get("requires-dist") or []) if isinstance(meta, dict) else []:
+            if isinstance(req, dict) and req.get("name") and req.get("specifier"):
+                g.constraints[(src_id, normalize_name(str(req["name"])))] = str(req["specifier"])
         # optional-dependencies / dev-dependencies 는 그룹별 테이블
         for group in ("optional-dependencies", "dev-dependencies"):
             grp = p.get(group) or {}
@@ -278,8 +292,12 @@ def parse_poetry_lock(raw: bytes) -> DepGraph:
         src_id = DepNode(name=name, version=str(p.get("version", "") or "")).id
         deps = p.get("dependencies") or {}
         if isinstance(deps, dict):
-            for dep_name in deps:
+            for dep_name, spec in deps.items():
                 _link(g, src_id, dep_name, by_name)
+                if isinstance(spec, dict):
+                    spec = spec.get("version")
+                if isinstance(spec, str) and spec.strip() and spec.strip() != "*":
+                    g.constraints[(src_id, normalize_name(dep_name))] = spec.strip()
 
     # poetry.lock 단독으로는 어느 것이 직접 의존성인지 알 수 없다(그건 pyproject
     # 쪽 정보다). 들어오는 간선이 없는 노드를 직접 의존성으로 근사한다.
@@ -370,11 +388,19 @@ def parse_pipfile_lock(raw: bytes) -> DepGraph:
 
 
 _REQ_RE = re.compile(r"^\s*([A-Za-z0-9._-]+)\s*(?:\[[^\]]*\])?\s*==\s*([A-Za-z0-9.\-+!]+)")
+# A requirement with a specifier (or none): `name[extras] <spec> ; markers`.
+_REQ_LOOSE_RE = re.compile(r"^\s*([A-Za-z0-9._-]+)\s*(?:\[[^\]]*\])?\s*([^;@#]*)")
 
 
 def parse_requirements(raw: bytes) -> DepGraph:
+    """A requirements file. A pinned line (`name==1.2`) is a resolved node.
+    An unpinned one (`name>=1.2`, `name`) used to be refused — four of seven
+    local projects could not be analysed at all (2026-10-22) — and is now a
+    version-less node with its specifier kept in `unresolved`: the engine
+    treats it under the conservative assumption and the report says the
+    manifest should be pinned for a sharper answer."""
     g = DepGraph(fmt="requirements.txt")
-    unresolved: list[str] = []
+    unparseable: list[str] = []
     for line in raw.decode("utf-8", "ignore").splitlines():
         line = line.split("#")[0].strip()
         if not line or line.startswith("-"):
@@ -382,17 +408,19 @@ def parse_requirements(raw: bytes) -> DepGraph:
         m = _REQ_RE.match(line)
         if m:
             node = DepNode(normalize_name(m.group(1)), m.group(2))
-        else:
-            unresolved.append(line)
+            g.nodes[node.id] = node
             continue
+        m = _REQ_LOOSE_RE.match(line)
+        if not m or not m.group(1) or "://" in line:
+            unparseable.append(line)
+            continue
+        node = DepNode(normalize_name(m.group(1)), "")
         g.nodes[node.id] = node
-    if unresolved:
-        sample = ", ".join(unresolved[:3])
-        raise GraphParseError(
-            "requirements.txt must pin every package with ==; "
-            f"unresolved requirement(s): {sample}")
+        g.unresolved[node.id] = (m.group(2) or "").strip() or "*"
     if not g.nodes:
-        raise GraphParseError("requirements.txt has no pinned packages")
+        sample = ", ".join(unparseable[:3])
+        raise GraphParseError("requirements.txt has no packages"
+                              + (f" (could not read: {sample})" if sample else ""))
     g.roots = sorted(g.nodes)
     return g
 

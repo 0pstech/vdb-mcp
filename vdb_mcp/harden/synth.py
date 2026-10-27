@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from .sinks import (
-    CMD_EXEC, DESERIALIZE, GLOBAL_STATE, NET_REQUEST, PATH_OP, REGEX_EVAL,
+    CMD_EXEC, DECOMPRESS, DESERIALIZE, GLOBAL_STATE, NET_REQUEST, PATH_OP, REGEX_EVAL,
 )
 
 if TYPE_CHECKING:
@@ -37,6 +37,7 @@ DEFENSE_CATALOG: dict[str, list[str]] = {
     NET_REQUEST:  ["scheme-allowlist", "host-allowlist", "block-internal-ranges"],
     REGEX_EVAL:   ["literal-escape", "length-cap"],
     GLOBAL_STATE: ["key-allowlist"],
+    DECOMPRESS:   ["expanded-size-cap", "measure-by-decompressing"],
 }
 
 # Human-readable sink names (used in the natural-language instruction and
@@ -46,6 +47,7 @@ SINK_LABEL: dict[str, str] = {
     DESERIALIZE: "deserialization", NET_REQUEST: "network request",
     REGEX_EVAL: "regular-expression evaluation",
     GLOBAL_STATE: "global state mutation",
+    DECOMPRESS: "archive decompression",
 }
 
 # 이 방식이 구조적으로 방어하지 못하는 위협 — 명세 【0077】이 열거하는 3종.
@@ -65,7 +67,7 @@ ALWAYS_UNDEFENDED: list[dict[str, str]] = [
 # 올린다. 분석 캐시 키에 이 값이 들어가기 때문이다 — 올리지 않으면 이미 분석한
 # 사용자는 결함이 고쳐진 뒤에도 옛 수정안을 계속 돌려받는다. 실제로 SSRF 를
 # 통과시키는 vdb_safe_url 이 캐시에서 그대로 다시 나왔다.
-SYNTH_VERSION = "vdb-synth/0.3.1"
+SYNTH_VERSION = "vdb-synth/0.3.2"
 
 _PY_WRAPPERS: dict[str, str] = {
     PATH_OP: '''def vdb_safe_path(value):
@@ -159,6 +161,44 @@ _PY_WRAPPERS: dict[str, str] = {
             "__proto__", "prototype", "constructor"):
         raise ValueError("magic key not allowed")
     return v''',
+    DECOMPRESS: '''def vdb_safe_archive(value, max_expanded=64 * 1024 * 1024):
+    """Refuse an archive or compressed stream that expands past a cap.
+
+    Measured by decompressing, never from sizes the archive declares: those
+    are written by whoever made the file. Accepts bytes, a path, or a
+    seekable file object (rewound afterwards); returns it unchanged.
+    """
+    import bz2, gzip, io, lzma, zipfile
+    if isinstance(value, (bytes, bytearray)):
+        data = bytes(value)
+    elif hasattr(value, "read"):
+        data = value.read()
+        value.seek(0)
+    else:
+        with open(value, "rb") as fh:
+            data = fh.read()
+    total = 0
+    def drain(fh):
+        nonlocal total
+        while True:
+            chunk = fh.read(1 << 20)
+            if not chunk:
+                return
+            total += len(chunk)
+            if total > max_expanded:
+                raise ValueError("archive expands past the size cap")
+    if zipfile.is_zipfile(io.BytesIO(data)):
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            for info in z.infolist():
+                with z.open(info) as fh:
+                    drain(fh)
+    elif data[:2] == b"\\x1f\\x8b":
+        drain(gzip.GzipFile(fileobj=io.BytesIO(data)))
+    elif data[:3] == b"BZh":
+        drain(bz2.BZ2File(io.BytesIO(data)))
+    elif data[:6] == b"\\xfd7zXZ\\x00":
+        drain(lzma.LZMAFile(io.BytesIO(data)))
+    return value''',
 }
 
 _TRUSTED_WRAPPER_OPS: dict[str, list[str]] = {
@@ -168,6 +208,7 @@ _TRUSTED_WRAPPER_OPS: dict[str, list[str]] = {
     "vdb_safe_url": DEFENSE_CATALOG[NET_REQUEST],
     "vdb_safe_pattern": DEFENSE_CATALOG[REGEX_EVAL],
     "vdb_safe_key": DEFENSE_CATALOG[GLOBAL_STATE],
+    "vdb_safe_archive": DEFENSE_CATALOG[DECOMPRESS],
 }
 
 
@@ -195,6 +236,7 @@ _WRAPPER_NAME = {
     PATH_OP: "vdb_safe_path", CMD_EXEC: "vdb_safe_arg",
     DESERIALIZE: "vdb_safe_load", NET_REQUEST: "vdb_safe_url",
     REGEX_EVAL: "vdb_safe_pattern", GLOBAL_STATE: "vdb_safe_key",
+    DECOMPRESS: "vdb_safe_archive",
 }
 
 

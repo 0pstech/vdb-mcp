@@ -329,8 +329,12 @@ async def list_tools() -> list[Tool]:
                 "(identifiers renamed, literals reduced to shapes, bodies "
                 "dropped); only that abstraction and the lockfile are sent, "
                 "never source text. Returns decided paths, a call-site fix "
-                "that does not modify the dependency, and the residual risk "
-                "the fix does not cover."
+                "that does not modify the dependency, the residual risk "
+                "the fix does not cover, and a `risk` block: every decided "
+                "path scored from its entry point to its sink and combined "
+                "into one project score (an interval when graph coverage is "
+                "low). To decide what to fix first, follow up with "
+                "vdb_harden_remediate."
             ),
             inputSchema={
                 "type": "object",
@@ -340,6 +344,8 @@ async def list_tools() -> list[Tool]:
                              "description": "Python file to analyze."},
                     "manifest_path": {"type": "string",
                                       "description": "uv.lock / poetry.lock / Pipfile.lock / requirements.txt / CycloneDX. Version ranges cannot be analyzed — the answer differs per resolved version."},
+                    "project": {"type": "string",
+                                "description": "Project name the risk score is filed under (one record per project, not per run). Default: the folder holding the manifest."},
                 },
             },
         ),
@@ -351,7 +357,10 @@ async def list_tools() -> list[Tool]:
                 "signed evidence payload bound to the original analysis, the "
                 "fixed IR fingerprint, and the dependency graph. This proves "
                 "VDB's decision over the submitted abstraction, not that the "
-                "abstraction matches a deployed binary."
+                "abstraction matches a deployed binary. Without an API key "
+                "there is no stored analysis to bind to: pass original_path "
+                "(the pre-fix file, e.g. from `git show HEAD:app.py`) and the "
+                "decision comes back unsigned."
             ),
             inputSchema={
                 "type": "object",
@@ -360,6 +369,46 @@ async def list_tools() -> list[Tool]:
                     "path": {"type": "string", "description": "Fixed Python file."},
                     "manifest_path": {"type": "string", "description": "The same resolved manifest used for vdb_harden."},
                     "path_id": {"type": "string", "description": "Path id issued by vdb_harden."},
+                    "original_path": {"type": "string",
+                                      "description": "The pre-fix file the path was decided on. Needed without an API key; ignored with one."},
+                },
+            },
+        ),
+        Tool(
+            name="vdb_harden_remediate",
+            description=(
+                "After vdb_harden, decide WHAT TO FIX FIRST. Re-abstracts the "
+                "same local file (source never leaves the machine) and asks "
+                "VDB to rank remediation candidates — upgrade a package on a "
+                "path, harden a call site's boundary, remove a package, apply "
+                "an execution policy to a sink class — by the project risk "
+                "each one removes per unit of cost, applied to the stored "
+                "attack graph counterfactually. Returns `score_before`, the "
+                "ranked `candidates` (each with delta, cost, cost_factors, "
+                "value, paths_closed and an `agent_rule` to apply), and a "
+                "`combination`: the steps that bring the score under "
+                "`target_risk`. Apply steps in rank order; a candidate with "
+                "`reverify_required` must be followed by vdb_harden_verify. "
+                "`estimated` candidates were not re-composed — treat their "
+                "delta as approximate. Use it when vdb_harden reports a "
+                "project score worth lowering and there is more than one "
+                "thing that could be changed."
+            ),
+            inputSchema={
+                "type": "object",
+                "required": ["path", "manifest_path"],
+                "properties": {
+                    "path": {"type": "string",
+                             "description": "The Python file vdb_harden analyzed."},
+                    "manifest_path": {"type": "string",
+                                      "description": "The same resolved manifest used for vdb_harden."},
+                    "project": {"type": "string",
+                                "description": "Project name the score is filed under. Default: the folder holding the manifest."},
+                    "target_risk": {"type": "number", "default": 0.2,
+                                    "minimum": 0, "maximum": 1,
+                                    "description": "The combination stops once the project score is under this."},
+                    "recompose": {"type": "boolean", "default": True,
+                                  "description": "Re-compose upgraded versions on the server (exact, slower). False estimates upgrades structurally and marks them `estimated`."},
                 },
             },
         ),
@@ -491,6 +540,14 @@ async def _tool_list_slop(args: dict) -> list[TextContent]:
     return [TextContent(type="text", text=json.dumps(data, indent=2, ensure_ascii=False))]
 
 
+def _project_name(manifest_path: str) -> str:
+    """The folder holding the lockfile — the same rule as `vdb harden`, so
+    the CLI and this tool file the score under one project record instead
+    of one per client. Risk-path mail goes out once per project."""
+    root = os.path.dirname(os.path.abspath(manifest_path))
+    return os.path.basename(root) or "project"
+
+
 async def _tool_harden(args: dict) -> list[TextContent]:
     """Abstract locally, then send only the abstraction.
 
@@ -516,10 +573,15 @@ async def _tool_harden(args: dict) -> list[TextContent]:
         "ir": ir.to_dict(),
         "manifest": manifest,
         "manifest_filename": os.path.basename(manifest_path),
+        "project": args.get("project") or _project_name(manifest_path),
     })
     return _json({
         "paths":      data.get("paths"),
         "hardenings": data.get("hardenings"),
+        # JP260065: every decided path scored entry→sink, combined into one
+        # project score. Dropped here before 0.2.7, so an agent that read
+        # this tool's output never saw the number remediate ranks against.
+        "risk":       data.get("risk"),
         "cached":     data.get("cached"),
         "analysis_complete": data.get("analysis_complete"),
         "summaries_missing": data.get("summaries_missing"),
@@ -530,7 +592,9 @@ async def _tool_harden(args: dict) -> list[TextContent]:
                  "Paths are decided from the dependency graph, independently "
                  "of whether any CVE exists. Apply the fix at the CALL SITE — "
                  "the dependency is never modified. Verify the issued path "
-                 "with vdb_harden_verify after applying it."),
+                 "with vdb_harden_verify after applying it. To rank what to "
+                 "fix first by risk removed per cost, call "
+                 "vdb_harden_remediate with the same path and manifest."),
     })
 
 
@@ -543,11 +607,54 @@ async def _tool_harden_verify(args: dict) -> list[TextContent]:
     ir = build_ir_from_file(path)
     with open(manifest_path, "rb") as fh:
         manifest = fh.read().decode("utf-8", "replace")
-    data = await _post("/v1/harden/verify", {
+    body = {
         "ir": ir.to_dict(),
         "manifest": manifest,
         "manifest_filename": os.path.basename(manifest_path),
         "path_id": args["path_id"],
+    }
+    if args.get("original_path"):
+        # Keyless re-verification: the server has no stored analysis for
+        # this caller, so it decides the pre-fix file again and binds the
+        # path to that.
+        body["original_ir"] = build_ir_from_file(args["original_path"]).to_dict()
+    data = await _post("/v1/harden/verify", body)
+    return _json(data)
+
+
+async def _tool_harden_remediate(args: dict) -> list[TextContent]:
+    """JP260065 조치 추론부(360): the same inputs as vdb_harden, plus the
+    risk the caller wants to get under. The response is returned as the API
+    sent it — `candidates` is already ranked and `combination` already
+    ordered, and the agent needs every field (delta_interval, cost_factors,
+    agent_rule, reverify_required, estimated) to act on a step."""
+    from .harden.ir import build_ir_from_file
+
+    path = args["path"]
+    manifest_path = args["manifest_path"]
+    ir = build_ir_from_file(path)
+    if not ir.callsites:
+        return _json({
+            "candidates": [],
+            "note": "no third-party call sites found in this file — nothing "
+                    "to remediate. Point it at the file vdb_harden analyzed.",
+        })
+    with open(manifest_path, "rb") as fh:
+        manifest = fh.read().decode("utf-8", "replace")
+    target = args.get("target_risk", 0.2)
+    try:
+        target = max(0.0, min(1.0, float(target)))
+    except (TypeError, ValueError):
+        return _json({"error": f"target_risk must be a number between 0 and 1, got {target!r}"})
+    # The server runs the analysis first when this IR has not been scored
+    # yet, then re-composes every upgrade candidate — the CLI gives it 240 s.
+    data = await _post("/v1/harden/remediate", timeout=240, body={
+        "ir": ir.to_dict(),
+        "manifest": manifest,
+        "manifest_filename": os.path.basename(manifest_path),
+        "project": args.get("project") or _project_name(manifest_path),
+        "target_risk": target,
+        "recompose": bool(args.get("recompose", True)),
     })
     return _json(data)
 
@@ -605,6 +712,7 @@ _DISPATCH = {
     "vdb_scan_lockfile":      _tool_scan_lockfile,
     "vdb_harden":             _tool_harden,
     "vdb_harden_verify":      _tool_harden_verify,
+    "vdb_harden_remediate":   _tool_harden_remediate,
     "vdb_vex":                _tool_vex,
     "vdb_lookup":             _tool_lookup,
     "vdb_search":             _tool_search,

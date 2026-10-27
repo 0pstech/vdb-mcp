@@ -45,10 +45,15 @@ The hosted endpoint reads the key from that header (0.2.3+; the
 `vdbApiToken` query parameter Smithery sets still works and takes precedence).
 
 That's it — the server talks to the hosted instance at `https://vdb.ai.kr`
-by default. Every tool needs an API key (free at <https://vdb.ai.kr/signup>,
-or the agent can request one by email itself: without a key each tool answers
-`agent_action: REFUSE` with a `request_key_url`). Currently unmetered beyond
-abuse protection:
+by default. The package gate (`vdb_check_package`, `vdb_check_packages`,
+`vdb_list_slopsquatting`) and the hardening tools (`vdb_harden`,
+`vdb_harden_remediate`, `vdb_harden_verify`, `vdb_vex`) answer **without a
+key** on a per-address allowance (0.2.8+; 100 packages an hour, 3 analyses
+an hour and 10 a day, projects up to 200 dependencies, nothing stored). The
+other tools need a free API key (<https://vdb.ai.kr/signup>, or the agent can
+request one by email itself: without a key those tools answer
+`agent_action: REFUSE` with a `request_key_url`). A key is currently unmetered
+beyond abuse protection:
 
 ```json
 {
@@ -74,11 +79,12 @@ abuse protection:
 | `vdb_check_mcp_server` | Trust tier + permission scopes of a community MCP server |
 | `vdb_list_slopsquatting` | Current slopsquatting candidates per ecosystem |
 | `vdb_harden` *(local only)* | Call-site hardening: can attacker data reach a dangerous sink through your dependencies? Source never leaves the machine |
-| `vdb_harden_verify` *(local only)* | Re-analyze after a fix and get signed evidence the path is closed |
+| `vdb_harden_verify` *(local only)* | Re-analyze after a fix and get signed evidence the path is closed (without a key: pass `original_path`, the pre-fix file; the decision comes back unsigned) |
+| `vdb_harden_remediate` *(local only)* | Rank what to fix first: upgrade / harden / remove / policy candidates by project risk removed per cost, plus the combination that reaches a target (0.2.7+) |
 | `vdb_vex` *(local only)* | OpenVEX document: which advisories cannot be reached |
 
-The three local-only tools need your files, so the hosted endpoint does not
-offer them — seven tools remote, ten with `uvx vdb-mcp`.
+The four local-only tools need your files, so the hosted endpoint does not
+offer them — seven tools remote, eleven with `uvx vdb-mcp`.
 
 ## The `vdb harden` command
 
@@ -89,7 +95,14 @@ MCP client (0.2.2 or newer):
 uvx --from vdb-mcp vdb harden app.py --manifest uv.lock   # analyze a call site
 uvx --from vdb-mcp vdb harden --doctor                     # which of network / key / service is at fault
 uvx --from vdb-mcp vdb harden ./src --manifest uv.lock --vex
+uvx --from vdb-mcp vdb harden app.py --manifest uv.lock --remediate --target 0.2   # what to fix first
+uvx --from vdb-mcp vdb harden ./src --manifest requirements.txt --exclude tests --exclude "*-fixtures"
+uvx --from vdb-mcp vdb harden app.py --manifest uv.lock --verify P-… --original /tmp/before/app.py  # keyless re-verification
 ```
+
+It works without a key (0.2.8+): three analyses an hour and ten a day per
+address, nothing stored, upgrades estimated. `VDB_API_KEY` keeps the project,
+re-scores it when a package on a path changes, and signs the evidence.
 
 Where PyPI is unreachable, `https://vdb.ai.kr/v1/harden/client.pyz` is the
 same CLI as one stdlib-only file (hash at `/v1/harden/client.sha256`):
@@ -100,7 +113,8 @@ same CLI as one stdlib-only file (hash at `/v1/harden/client.sha256`):
 | Variable | Default | Meaning |
 |---|---|---|
 | `VDB_API_URL` | `https://vdb.ai.kr` | VDB instance to query (set for self-hosted) |
-| `VDB_API_TOKEN` | *(empty)* | `vdb_…` API key — required for every tool |
+| `VDB_API_TOKEN` | *(empty)* | `vdb_…` API key — lifts the keyless limits; required for lookup, search and SBOM scanning |
+| `VDB_PROXY_TOKEN` | *(empty)* | Hosted endpoint only (0.2.9+): a secret shared with the API so it believes the visitor address this server forwards, and keyless visitors are counted each as themselves. Grants nothing else; leave unset locally |
 | `VDB_API_ADDR` | `144.202.127.83` | Where VDB lives when this machine's DNS cannot say — see below |
 | `MCP_MODE` | `stdio` | `stdio` or `sse` (long-running HTTP server) |
 | `MCP_PORT` | `7700` | SSE port |
@@ -131,5 +145,3 @@ restrictions: you may not offer this software to third parties as a hosted
 or managed service, or resell it as a product. Commercial licensing beyond
 that: <dev@egdee.com>. API usage is governed by the VDB service terms
 regardless of how you call it.
-
-[![Wellknown](https://wellknown.network/agents/vdb/badge.svg)](https://wellknown.network/agents/vdb)

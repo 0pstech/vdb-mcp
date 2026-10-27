@@ -288,8 +288,227 @@ def _coverage_line(out: dict) -> str:
     return " · ".join(bits)
 
 
+# Printed on every result. The analysis follows arguments INTO dependencies;
+# it never looks at what your own code does with the standard library.
+# os.system(cmd), eval(expr), pickle.loads(blob) with a tainted argument all
+# come back as zero paths — and "No risky dataflow path found" read as a
+# clean bill for them. Running it on our own service, we learned VDB had none
+# of those calls from grep, not from this tool. Say what was not examined.
+SCOPE_NOTE = ("scope: dataflow into your dependencies, and your own standard-library "
+              "calls that run commands, deserialize, decompress or open connections "
+              "(subprocess, eval/exec, pickle, zlib/zipfile/tarfile, urlopen). File "
+              "paths (open, os.path) and regular expressions in your own code are not "
+              "examined — use a static analyser such as Bandit or Semgrep for those.")
+
+
+def _fmt_risk(x) -> str:
+    if isinstance(x, list) and len(x) == 2:
+        return f"{x[0]:.2f}–{x[1]:.2f}"
+    try:
+        return f"{float(x):.2f}"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def _site(callsite_id: str | None, files: dict | None) -> str:
+    """`F0055:c5` → `app/routes.py` when the tree was abstracted here; a
+    single file's ids carry no prefix and map through the empty key."""
+    if not callsite_id:
+        return ""
+    prefix = callsite_id.split(":")[0] if ":" in callsite_id else ""
+    return (files or {}).get(prefix, "")
+
+
+def _print_keyless(out: dict) -> None:
+    """One line when the answer came back without a key: what it did not
+    get, and what is left of the allowance."""
+    a = out.get("anonymous")
+    if not a:
+        return
+    left = a.get("remaining")
+    allowance = "" if left is None else f"; {left} of {a.get('limit_per_hour')} left this hour"
+    print(f"  keyless run: not stored, not watched, upgrades estimated{allowance}. "
+          "A free key keeps the project: VDB_API_KEY, from /v1/auth/request-key.")
+
+
+def _print_risk(out: dict, files: dict | None = None) -> None:
+    """The project's risk score (JP260065): per path from an entry point to
+    a sink, aggregated noisy-OR, with the coverage that qualifies it. An
+    interval means too little of the graph was analysed for one number."""
+    risk = out.get("risk")
+    if not risk:
+        return
+    cov = risk.get("coverage") or {}
+    interval = risk.get("interval")
+    score = risk.get("score")
+    saturated = (score or 0) >= 0.995
+    if interval and saturated and interval[1] >= 0.995:
+        # 1.00–1.00 reads as broken; the decided paths alone saturate it,
+        # and from here the open-path count and their risk mass (the sum of
+        # their scores) are what still tell projects apart.
+        head = (f"Project risk: 1.00  (saturated: {risk.get('open_paths', 0)} open paths, "
+                f"risk mass {risk.get('risk_mass', 0):.1f}")
+    elif interval:
+        head = f"Project risk: {_fmt_risk(interval)}  (interval — analysis incomplete"
+    else:
+        head = f"Project risk: {_fmt_risk(score)}"
+    if interval:
+        if cov.get("packages"):
+            head += (f"; {cov.get('packages_with_summary', 0)} of {cov['packages']} "
+                     f"dependencies have a summary")
+        if cov.get("undetermined_paths"):
+            head += f", {cov['undetermined_paths']} undetermined path(s)"
+        head += ")"
+    print(head)
+    by_sink = risk.get("by_sink") or {}
+    if by_sink and (saturated or len(by_sink) > 1):
+        print("  highest path per sink: " + " · ".join(f"{k} {v:.2f}" for k, v in list(by_sink.items())[:5]))
+    if cov.get("paths_capped"):
+        print(f"  the scored list was cut at {risk.get('path_count')} paths — narrow the analysis "
+              "(a package or service directory, --exclude) for a complete one")
+    limited = [u for u in (out.get("_local_unparsed") or []) if str(u).startswith("LIMITED:")]
+    if limited:
+        print(f"  {limited[0].split(':', 1)[1]} file(s) beyond the per-run file limit were not read — "
+              "analyse a narrower path or --exclude what is not the application")
+    paths = risk.get("paths") or []
+    # The same shape at twenty call sites is one line, not twenty.
+    groups: dict[tuple, dict] = {}
+    for p in paths:
+        if p.get("score", 0) < 0.005:          # would print as 0.00
+            continue
+        ev = p.get("evidence") or {}
+        tag = ev.get("vuln_id") or ev.get("origin") or ev.get("reason") or ""
+        key = (p.get("entry"), tag, tuple(p.get("packages") or []), p.get("sink_class"))
+        g = groups.setdefault(key, {"n": 0, "score": p["score"], "grade": p.get("grade", ""), "files": set()})
+        g["n"] += 1
+        g["score"] = max(g["score"], p["score"])
+        f = _site(p.get("callsite_id"), files)
+        if f:
+            g["files"].add(f)
+    for key, g in sorted(groups.items(), key=lambda kv: -kv[1]["score"])[:8]:
+        entry, tag, chain, sink = key
+        times = f" ×{g['n']}" if g["n"] > 1 else ""
+        where = ""
+        if g["files"]:
+            fs = sorted(g["files"])
+            where = "  in " + ", ".join(fs[:3]) + (f" +{len(fs) - 3} more" if len(fs) > 3 else "")
+        print(f"  {g['grade']:<9} {_fmt_risk(g['score']):>5}{times:<5} "
+              f"{entry}{' ' + tag if tag else ''} > {' > '.join(chain) or '-'} > {sink}{where}")
+    undet = [p for p in paths if p.get("undetermined")]
+    n_undet = cov.get("undetermined_paths") or len(undet)
+    if n_undet:
+        ends = {}
+        for p in undet:
+            end = (p.get("packages") or ["?"])[-1]
+            ends[end] = ends.get(end, 0) + 1
+        top = sorted(ends.items(), key=lambda kv: -kv[1])[:5]
+        print(f"  undetermined: {n_undet} path(s) end in a package without a summary"
+              + (" — most often " + ", ".join(f"{k} ({v})" for k, v in top) if top else "")
+              + "; queued for building, re-run later for a sharper answer")
+    if len(groups) > 8:
+        print(f"  … {risk.get('path_count', len(paths))} scored paths in total (--json for all)")
+    print()
+
+
+def _shorten(path: str, n: int) -> str:
+    """Keep the file name: `…/vdb_mcp/harden/cli.py` beats a cut-off prefix."""
+    if len(path) <= n:
+        return path
+    return "…" + path[-(n - 1):]
+
+
+def _action(c: dict, files: dict | None) -> str:
+    t = c.get("target") or {}
+    k = c["kind"]
+    if k == "upgrade":
+        if t.get("from"):
+            what = f"upgrade {t.get('package')} {t.get('from')} → {t.get('to')}"
+        else:
+            what = f"pin {t.get('package')} at {t.get('to')}"
+        if c.get("coverage_gain"):
+            what += " (unlocks analysis)"
+        elif c.get("estimated"):
+            what += " (estimated)"
+        return what
+    if k == "harden":
+        if t.get("callsite_id"):
+            f = _site(t["callsite_id"], files)
+            if f:
+                return f"harden {_shorten(f, 38)}:{t.get('line')}"
+            return f"harden call site {t.get('line')} ({t['callsite_id']})"
+        n = len(t.get("callsites") or [])
+        if t.get("sink_class"):
+            return f"harden all {n} call sites reaching {t['sink_class']}"
+        return f"harden {n} call sites into {t.get('package')}"
+    if k == "remove":
+        return f"remove {t.get('package')}"
+    return f"{t.get('policy')} on {t.get('sink_class')} sinks"
+
+
+def _print_remediation(out: dict, files: dict | None = None) -> int:
+    """조치 순위(394) — 도 9: rank, action, Δrisk, cost, value, paths closed."""
+    cands = out.get("candidates") or []
+    print(f"Remediation ranking — risk {_fmt_risk(out.get('score_before'))}, "
+          f"target {_fmt_risk(out.get('target_risk'))}")
+    if not cands:
+        print("  nothing to rank: no open path.")
+        return 0
+    print(f"  {'#':>2}  {'action':<52} {'Δrisk':>9} {'cost':>5} {'value':>6}  closes")
+    shown = 0
+    folded = 0
+    last_shape = None
+    for c in cands:
+        t = c.get("target") or {}
+        delta = c.get("delta_interval") or c.get("delta")
+        shape = (c["kind"], bool(t.get("callsite_id")), _fmt_risk(delta), round(c.get("cost", 0), 2),
+                 round(c.get("closed_risk") or 0, 2), c.get("paths_closed"))
+        # Thirty single call sites with the same numbers are one story.
+        if t.get("callsite_id") and shape == last_shape and shown >= 3:
+            folded += 1
+            continue
+        if shown >= 12:
+            folded += 1
+            continue
+        last_shape = shape
+        closes = f"{c.get('paths_closed', 0)}"
+        if c.get("closed_risk"):
+            closes += f" (mass {c['closed_risk']:.1f})"
+        if c.get("paths_opened"):
+            closes += f", {c['paths_opened']} newly decided"
+        print(f"  {c.get('rank', 0):>2}  {_action(c, files)[:52]:<52} {_fmt_risk(delta):>9} "
+              f"{c.get('cost', 0):>5.2f} {c.get('value', 0):>6.3f}  {closes}")
+        shown += 1
+        cf = c.get("cost_factors") or {}
+        if cf.get("constraint_conflicts"):
+            names = ", ".join(x.get("parent", "") for x in cf["constraint_conflicts"])
+            print(f"      conflicts with the constraint declared by {names} — upgrade them with it")
+    if folded:
+        print(f"  … {folded} more candidate(s) (--json for all)")
+    combo = out.get("combination") or {}
+    steps = combo.get("steps") or []
+    if steps:
+        saturated = (lambda v: (v[0] if isinstance(v, list) else v) >= 0.995)(out.get("score_before") or 0)
+
+        def after(st: dict) -> str:
+            s = _fmt_risk(st["score_after"])
+            if saturated and "open_paths_after" in st:
+                s += f" ({st['open_paths_after']} open, mass {st.get('risk_mass_after', 0):.1f})"
+            return s
+        head = steps[:6]
+        chain = ", ".join(f"#{st['rank']} → {after(st)}" for st in head)
+        if len(steps) > 6:
+            chain += f", … {len(steps) - 6} more step(s) → {after(steps[-1])}"
+        mark = "reaches" if combo.get("reached") else "does not reach"
+        print(f"  Combination: {chain}  ({mark} the target; {len(steps)} step(s), cost {combo.get('cumulative_cost', 0):.2f})")
+        if saturated and not combo.get("reached"):
+            print("  (a saturated score cannot reach the target in a few steps; read the open-path count and mass)")
+    print("  Re-verify after each step: vdb harden … --verify <path_id>")
+    _print_keyless(out)
+    return 0
+
+
 def _print_report(out: dict, callsites: dict | None = None,
-                  filename: str | None = None) -> int:
+                  filename: str | None = None, files: dict | None = None) -> int:
     paths = out.get("paths") or []
     hard = {h["path_id"]: h for h in (out.get("hardenings") or [])}
     coverage = _coverage_line(out)
@@ -303,6 +522,9 @@ def _print_report(out: dict, callsites: dict | None = None,
                   f"Re-run shortly for a sharper answer.)")
         if coverage:
             print(f"  {coverage}")
+        print(f"  {SCOPE_NOTE}")
+        _print_risk(out, files)
+        _print_keyless(out)
         if incomplete:
             print("  Analysis is incomplete; absence is not a safety determination.")
             return 2
@@ -325,13 +547,17 @@ def _print_report(out: dict, callsites: dict | None = None,
           f"({len(paths)} path(s) in total, independently of whether any CVE exists)")
     if coverage:
         print(coverage)
+    print(SCOPE_NOTE)
     print()
+    _print_risk(out, files)
+    _print_keyless(out)
 
     for site_id, site in sites.items():
         where = ""
         cs = (callsites or {}).get(site_id)
         if cs and cs.get("line"):
-            where = f"{filename or 'line'}:{cs['line']}  " if filename else f"line {cs['line']}  "
+            f = filename or _site(site_id, files)
+            where = f"{f}:{cs['line']}  " if f else f"line {cs['line']}  "
         print(f"* {where}{site['api']}  [{site['pkg']}@{site['ver']}]")
         for sink, group in sorted(site["sinks"].items()):
             _print_sink_group(sink, group, hard)
@@ -495,6 +721,20 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--rules", action="store_true",
                     help="print only the agent rules (JSON), for AI coding agents")
     ap.add_argument("--verify", metavar="PATH_ID", help="re-verify that the path is closed after applying the fix")
+    ap.add_argument("--original", metavar="PATH",
+                    help="with --verify and no API key: the pre-fix file or tree the path was "
+                         "decided on (e.g. a `git worktree` of the previous commit). A key "
+                         "binds the path to the stored analysis instead and signs the evidence.")
+    ap.add_argument("--exclude", action="append", default=[], metavar="PATH",
+                    help="leave a directory out of a tree analysis (relative path or glob, "
+                         "repeatable): backups, vendored copies, benchmark fixtures")
+    ap.add_argument("--remediate", action="store_true",
+                    help="rank remediations by risk reduction per cost and show the combination "
+                         "that reaches --target")
+    ap.add_argument("--target", type=float, default=0.2, metavar="RISK",
+                    help="project risk to get under with --remediate (default 0.2)")
+    ap.add_argument("--no-recompose", action="store_true",
+                    help="with --remediate: estimate upgrades instead of re-composing them (faster)")
     ap.add_argument("--vex", action="store_true",
                     help="emit an OpenVEX document: which advisories in the "
                          "lockfile cannot be reached by attacker-controlled "
@@ -522,7 +762,7 @@ def main(argv: list[str] | None = None) -> int:
     if not os.path.exists(args.file):
         raise SystemExit(f"no such file: {args.file}")
     if os.path.isdir(args.file):
-        ir = build_ir_from_tree(args.file)
+        ir = build_ir_from_tree(args.file, exclude=tuple(args.exclude))
         if not ir.files:
             raise SystemExit(f"no Python files under {args.file}")
     else:
@@ -549,15 +789,41 @@ def main(argv: list[str] | None = None) -> int:
     if args.vex:
         return _run_vex(base, payload, manifest, manifest_text, args)
 
+    if args.remediate:
+        payload["target_risk"] = args.target
+        payload["recompose"] = not args.no_recompose
+        out = _post(f"{base}/v1/harden/remediate", payload, args.token,
+                    timeout=float(os.environ.get("VDB_HARDEN_TIMEOUT", "240")))
+        if args.json:
+            print(json.dumps(out, indent=2, ensure_ascii=False))
+            return 0
+        return _print_remediation(out, getattr(ir, "local_files", None) or {"": args.file})
+
     if args.verify:
         payload["path_id"] = args.verify
+        if args.original:
+            if not os.path.exists(args.original):
+                raise SystemExit(f"no such file: {args.original}")
+            if os.path.isdir(args.original):
+                payload["original_ir"] = build_ir_from_tree(
+                    args.original, exclude=tuple(args.exclude)).to_dict()
+            else:
+                payload["original_ir"] = build_ir_from_file(args.original).to_dict()
+        elif not args.token:
+            raise SystemExit(
+                "re-verification without an API key needs the pre-fix code too:\n"
+                "  vdb harden <fixed> --verify <path_id> --original <pre-fix file or tree>\n"
+                "(`git worktree add /tmp/before HEAD~1` gives you the tree). With a free "
+                "key (VDB_API_KEY) the path is bound to your stored analysis and the "
+                "evidence is signed.")
         out = _post(f"{base}/v1/harden/verify", payload, args.token)
         ev = out["evidence"]
         mark = "CLOSED" if ev["closed"] else "OPEN"
         print(f"path {ev['path_id']} -> {mark} ({ev['method']})")
         print(f"  graph hash : {ev['graph_hash'][:16]}...")
         print(f"  decided at : {ev['decided_at']}")
-        print(f"  signature  : {ev['signature'][:24]}...")
+        sig = ev.get("signature")
+        print(f"  signature  : {sig[:24] + '...' if sig else 'none (keyless — a free key signs the evidence)'}")
         print(f"  note       : {out['note']}")
         return 0 if ev["closed"] else 1
 
@@ -584,8 +850,9 @@ def main(argv: list[str] | None = None) -> int:
     # The IR never leaves without the call sites; the report may as well say
     # which line to open.
     cs_map = {c["id"]: c for c in ir.to_dict().get("callsites", [])}
+    out["_local_unparsed"] = list(ir.unparsed)       # the file limit is known here, not on the server
     where = None if os.path.isdir(args.file) else args.file
-    return _print_report(out, cs_map, where)
+    return _print_report(out, cs_map, where, getattr(ir, "local_files", None) or {"": args.file})
 
 
 if __name__ == "__main__":

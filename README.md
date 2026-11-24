@@ -98,7 +98,15 @@ uvx --from vdb-mcp vdb harden ./src --manifest uv.lock --vex
 uvx --from vdb-mcp vdb harden app.py --manifest uv.lock --remediate --target 0.2   # what to fix first
 uvx --from vdb-mcp vdb harden ./src --manifest requirements.txt --exclude tests --exclude "*-fixtures"
 uvx --from vdb-mcp vdb harden app.py --manifest uv.lock --verify P-… --original /tmp/before/app.py  # keyless re-verification
+uvx --from vdb-mcp vdb harden app.py --manifest uv.lock --apply P-…            # the fix as a diff (dry run)
+uvx --from vdb-mcp vdb harden app.py --manifest uv.lock --apply P-… --write    # write it into the file, then re-verify (0.2.10+)
 ```
+
+`--apply` places the synthesized fix itself — the wrapper function once per
+module, the call-site argument wrapped, the values only you can choose as
+`VDB_*` constants marked `TODO(vdb)` — and `--write` edits the file in place
+(everything else stays byte-for-byte) and re-verifies, keyless too. Python
+call sites only.
 
 It works without a key (0.2.8+): three analyses an hour and ten a day per
 address, nothing stored, upgrades estimated. `VDB_API_KEY` keeps the project,

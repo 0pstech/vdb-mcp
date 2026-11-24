@@ -425,6 +425,63 @@ def parse_requirements(raw: bytes) -> DepGraph:
     return g
 
 
+# ── 다른 생태계의 명세 ─────────────────────────────────────────────────────
+# What a manifest name says about the language of a project. The parsers
+# below know Python only; a project that hands us one of these is demand for
+# a second language, and both the server and the CLI count it
+# (harden_language_attempts) so that decision rests on a number.
+FOREIGN_MANIFESTS: dict[str, str] = {
+    "package-lock.json": "javascript", "yarn.lock": "javascript",
+    "pnpm-lock.yaml": "javascript", "npm-shrinkwrap.json": "javascript",
+    "bun.lock": "javascript", "bun.lockb": "javascript", "package.json": "javascript",
+    "go.sum": "go", "go.mod": "go",
+    "cargo.lock": "rust", "cargo.toml": "rust",
+    "gemfile.lock": "ruby", "gemfile": "ruby",
+    "composer.lock": "php", "composer.json": "php",
+    "pom.xml": "java", "build.gradle": "java", "build.gradle.kts": "java",
+    "gradle.lockfile": "java",
+    "packages.lock.json": "dotnet",
+}
+# The vocabulary the attempts table holds; anything else is "unknown".
+ATTEMPT_LANGUAGES: tuple[str, ...] = (
+    "javascript", "go", "rust", "ruby", "php", "java", "dotnet", "unknown")
+_LANGUAGE_ALIASES: dict[str, str] = {
+    "js": "javascript", "node": "javascript", "nodejs": "javascript",
+    "typescript": "javascript", "ts": "javascript",
+    "golang": "go", "rb": "ruby", "kotlin": "java", "scala": "java",
+    "csharp": "dotnet", "c#": "dotnet", "fsharp": "dotnet", ".net": "dotnet",
+}
+
+
+def manifest_language(filename: str) -> str | None:
+    """The language a manifest name signals when it is not one of ours, or
+    None when the name is a Python manifest or says nothing."""
+    name = (filename or "").lower().rsplit("/", 1)[-1]
+    if name in FOREIGN_MANIFESTS:
+        return FOREIGN_MANIFESTS[name]
+    if name.endswith((".csproj", ".fsproj", ".vbproj")):
+        return "dotnet"
+    return None
+
+
+def is_python_manifest(filename: str) -> bool:
+    """True when build_graph picks a parser from the name alone."""
+    name = (filename or "").lower().rsplit("/", 1)[-1]
+    return (name in ("uv.lock", "poetry.lock", "pipfile.lock", "bom.json", "sbom.json")
+            or name.endswith((".cdx.json", ".spdx.json"))
+            or (name.startswith("requirements") and name.endswith(".txt")))
+
+
+def normalize_language(language: str | None) -> str:
+    """An IR's `language` field (or a CLI guess) into the attempts vocabulary.
+    "python" stays "python"; the caller decides whether that is an attempt."""
+    lang = (language or "").strip().lower()
+    lang = _LANGUAGE_ALIASES.get(lang, lang)
+    if lang == "python":
+        return "python"
+    return lang if lang in ATTEMPT_LANGUAGES else "unknown"
+
+
 # ── 진입점 ─────────────────────────────────────────────────────────────────
 
 def build_graph(raw: bytes, filename: str = "") -> DepGraph:

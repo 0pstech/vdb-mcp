@@ -570,7 +570,8 @@ _SKIP_DIRS = {".git", ".venv", "venv", "__pycache__", "node_modules", ".tox",
 
 
 def build_ir_from_tree(root: str, max_files: int = 2000,
-                       exclude: tuple[str, ...] = ()) -> CodeIR:
+                       exclude: tuple[str, ...] = (),
+                       file_paths: "dict[str, str] | None" = None) -> CodeIR:
     """Abstract every Python file under `root` into ONE representation.
 
     Per-file analysis cannot support a not_affected claim: "nothing reaches
@@ -582,6 +583,12 @@ def build_ir_from_tree(root: str, max_files: int = 2000,
     failing the run — one syntax error in a scratch file should not block the
     analysis — but it also means coverage is incomplete, and the caller has to
     be able to see that before attesting to anything.
+
+    `file_paths`, when given, is filled with opaque id → path relative to
+    `root`. The IR itself never carries file names (they do not leave the
+    user's machine); the pre-CVE ledger analyses public repositories on the
+    server and needs them, because `F0003` is a position in sorted order
+    and moves whenever a file is added ahead of it.
     """
     merged = CodeIR()
     unparsed: list[str] = []
@@ -630,6 +637,8 @@ def build_ir_from_tree(root: str, max_files: int = 2000,
 
     for file_index, path in enumerate(ordered, start=1):
         opaque = f"F{file_index:04d}"
+        if file_paths is not None:
+            file_paths[opaque] = os.path.relpath(path, root).replace(os.sep, "/")
         try:
             with open(path, encoding="utf-8", errors="ignore") as fh:
                 one = build_ir(fh.read())

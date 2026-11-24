@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vdb-mcp"
-version = "0.2.9"
+version = "0.2.10"
 description = "MCP server for VDB — AI-aware vulnerability database (packages, MCP servers, models). Check packages for CVEs and slopsquatting before installing."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -36,6 +36,9 @@ dependencies = [
     # then this bound is what keeps the published package usable.
     "mcp>=1.0.0,<2",
     "httpx>=0.27.0",
+    # `vdb harden --apply` rewrites the user's source with the fix; imported
+    # only there, so every other command stays stdlib-only.
+    "libcst>=1.4.0",
 ]
 
 [project.urls]

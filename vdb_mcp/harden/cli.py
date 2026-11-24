@@ -6,8 +6,12 @@
     python3 -m vdb.harden.cli app.py --manifest uv.lock
     python3 -m vdb.harden.cli app.py --emit-ir          # 나가는 내용 그대로 확인
     python3 -m vdb.harden.cli app.py --verify P-xxxx    # 수정 후 재검증
+    python3 -m vdb.harden.cli app.py --apply P-xxxx     # 수정안을 diff 로 (dry run)
+    python3 -m vdb.harden.cli app.py --apply P-xxxx --write   # 파일에 쓰고 바로 재검증
 
 표준 라이브러리만 쓴다 — 개발자 머신에 아무것도 설치하지 않고 돌아야 하기 때문.
+예외는 --apply 하나: 소스를 서식 그대로 고쳐 쓰는 데 libcst 가 필요하고, 그
+import 는 apply.py 안에서만, 쓰는 순간에만 일어난다.
 """
 
 from __future__ import annotations
@@ -17,12 +21,15 @@ import hashlib
 import http.client
 import json
 import os
+import shutil
 import socket
 import ssl
 import sys
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+from typing import NoReturn
 
 from .ir import build_ir_from_file, build_ir_from_tree
 
@@ -35,6 +42,115 @@ def _validate_api_url(url: str) -> None:
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise SystemExit("VDB API URL must use http or https and include a host")
+
+
+# Source extensions that say what a project is when it is not Python. Only
+# used to name the language of a refused target; nothing about the files
+# themselves leaves the machine.
+_FOREIGN_SOURCE_EXT = {
+    ".js": "javascript", ".mjs": "javascript", ".cjs": "javascript",
+    ".jsx": "javascript", ".ts": "javascript", ".tsx": "javascript",
+    ".go": "go", ".rs": "rust", ".rb": "ruby", ".php": "php",
+    ".java": "java", ".kt": "java", ".cs": "dotnet",
+}
+_GUESS_SKIP_DIRS = {".git", "node_modules", "vendor", "target", "dist", "build",
+                    ".venv", "venv", "__pycache__"}
+
+
+def _guess_language(target: str) -> tuple[str, str]:
+    """What a refused target is, as (language, manifest name).
+
+    A manifest from another ecosystem is the strongest signal and is looked
+    for where _find_manifest looks; failing that, the source extensions in a
+    bounded walk; failing that, "unknown" with no manifest."""
+    from .depgraph import manifest_language
+
+    if os.path.isdir(target):
+        root = os.path.abspath(target)
+    else:
+        ext = os.path.splitext(target)[1].lower()
+        root = os.path.dirname(os.path.abspath(target)) or "."
+        if ext in _FOREIGN_SOURCE_EXT:
+            d = root
+            for _ in range(4):
+                try:
+                    names = sorted(os.listdir(d))
+                except OSError:
+                    names = []
+                for name in names:
+                    if manifest_language(name) == _FOREIGN_SOURCE_EXT[ext]:
+                        return _FOREIGN_SOURCE_EXT[ext], name
+                parent = os.path.dirname(d)
+                if parent == d:
+                    break
+                d = parent
+            return _FOREIGN_SOURCE_EXT[ext], ""
+    d = root
+    for _ in range(4):
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            names = []
+        for name in names:
+            lang = manifest_language(name)
+            if lang:
+                return lang, name
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    counts: dict[str, int] = {}
+    seen = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [x for x in dirnames if x not in _GUESS_SKIP_DIRS and not x.startswith(".")]
+        for f in filenames:
+            lang = _FOREIGN_SOURCE_EXT.get(os.path.splitext(f)[1].lower())
+            if lang:
+                counts[lang] = counts.get(lang, 0) + 1
+            seen += 1
+            if seen >= 5000:
+                break
+        if seen >= 5000:
+            break
+    if counts:
+        return max(counts, key=lambda k: counts[k]), ""
+    return "unknown", ""
+
+
+def _report_attempt(base: str, language: str, manifest: str) -> bool:
+    """Tell VDB that a project that is not Python asked for hardening: the
+    language guessed and the manifest's basename, nothing else, so the
+    decision to support a second language rests on a count. Best effort —
+    never raises, never holds the exit for more than a few seconds.
+    VDB_NO_TELEMETRY=1 turns it off."""
+    if os.environ.get("VDB_NO_TELEMETRY", "").strip() not in ("", "0"):
+        return False
+    try:
+        _validate_api_url(base)
+        data = json.dumps({"language": language, "manifest": manifest}).encode()
+        req = urllib.request.Request(f"{base}/v1/harden/attempt", data=data, method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("X-VDB-Client", "vdb-harden-cli")
+        with _open(req, 5.0) as r:
+            return 200 <= int(getattr(r, "status", 200) or 200) < 300
+    except (Exception, SystemExit):  # noqa: BLE001 — the refusal is the answer
+        return False
+
+
+def _refuse_not_python(args, reason: str, *, only_with_manifest: bool = False) -> NoReturn:
+    """Exit with `reason`, after counting the attempt when the target looks
+    like another language. With `only_with_manifest`, count only when a
+    manifest from another ecosystem was actually seen — a Python project
+    that merely lacks a lockfile is not demand for another language."""
+    language, manifest = _guess_language(args.file)
+    msg = reason
+    if not (only_with_manifest and not manifest):
+        if _report_attempt(args.api_url.rstrip("/"), language, manifest):
+            what = f"a {language} project" if language != "unknown" else "this request"
+            msg += (f"\nvdb harden is Python-only today; {what} was counted "
+                    "(language and manifest name only) so a second language can be "
+                    "decided on demand. VDB_NO_TELEMETRY=1 opts out.")
+    raise SystemExit(msg)
 
 
 def _find_manifest(start: str) -> str | None:
@@ -503,6 +619,7 @@ def _print_remediation(out: dict, files: dict | None = None) -> int:
         if saturated and not combo.get("reached"):
             print("  (a saturated score cannot reach the target in a few steps; read the open-path count and mass)")
     print("  Re-verify after each step: vdb harden … --verify <path_id>")
+    print("  Harden steps land with: vdb harden … --apply <path_id> --write")
     _print_keyless(out)
     return 0
 
@@ -692,6 +809,151 @@ def _run_vex(base: str, payload: dict, manifest: str, manifest_text: str,
     return 0
 
 
+def _verify(base: str, payload: dict, path_id: str, token: str,
+            original_ir: dict | None, json_out: bool = False) -> tuple[int, dict]:
+    """재검증(170) 호출 — --verify 와 --apply --write 가 같은 길을 간다.
+
+    Keyless, the server has no stored analysis to bind the path to, so the
+    pre-fix representation travels too; with a key the path is bound to the
+    stored analysis and the evidence is signed."""
+    payload = {**payload, "path_id": path_id}
+    if original_ir is not None:
+        payload["original_ir"] = original_ir
+    elif not token:
+        raise SystemExit(
+            "re-verification without an API key needs the pre-fix code too:\n"
+            "  vdb harden <fixed> --verify <path_id> --original <pre-fix file or tree>\n"
+            "(`git worktree add /tmp/before HEAD~1` gives you the tree). With a free "
+            "key (VDB_API_KEY) the path is bound to your stored analysis and the "
+            "evidence is signed.")
+    out = _post(f"{base}/v1/harden/verify", payload, token)
+    ev = out["evidence"]
+    if json_out:
+        return (0 if ev["closed"] else 1), out
+    mark = "CLOSED" if ev["closed"] else "OPEN"
+    print(f"path {ev['path_id']} -> {mark} ({ev['method']})")
+    print(f"  graph hash : {ev['graph_hash'][:16]}...")
+    print(f"  decided at : {ev['decided_at']}")
+    sig = ev.get("signature")
+    print(f"  signature  : {sig[:24] + '...' if sig else 'none (keyless — a free key signs the evidence)'}")
+    print(f"  note       : {out['note']}")
+    return (0 if ev["closed"] else 1), out
+
+
+def _run_apply(args, ir, base: str, payload: dict) -> int:
+    """--apply PATH_ID: analyse, place the synthesized fix, diff or write, verify.
+
+    The analysis is run again rather than trusted from a previous run so the
+    line numbers the rewrite targets are the ones of the file as it is now.
+    Nothing is written without --write; with it, the pre-edit representation
+    (the IR this very run was decided on) is what a keyless verification
+    binds the path to, so no --original is needed."""
+    from .apply import ApplyError, apply_fix
+
+    out = _post(f"{base}/v1/harden/analyze", payload, args.token,
+                timeout=float(os.environ.get("VDB_HARDEN_TIMEOUT", "240")))
+    path = next((p for p in out.get("paths") or [] if p.get("path_id") == args.apply), None)
+    if path is None:
+        ids = [p["path_id"] for p in out.get("paths") or [] if p.get("path_id")]
+        more = f" — decided here: {', '.join(ids[:6])}" if ids else " — no path was decided here"
+        if out.get("incomplete") or not out.get("analysis_complete", True):
+            more += " (analysis incomplete)"
+        raise SystemExit(f"{args.apply} is not a path of this analysis{more}")
+    cs = next((c for c in ir.callsites if c.id == path.get("callsite_id")), None)
+    if cs is None:
+        raise SystemExit(f"the call site of {args.apply} is not in the local representation")
+
+    files = getattr(ir, "local_files", None) or {}
+    rel = _site(cs.id, files) if os.path.isdir(args.file) else args.file
+    target = os.path.join(args.file, rel) if os.path.isdir(args.file) else args.file
+    if getattr(ir, "language", "python") != "python" or not target.endswith(".py"):
+        sys.stderr.write(f"--apply supports Python call sites only; {rel or cs.id} is not one\n")
+        return 2
+
+    hop = (path.get("hops") or [{}])[0]
+    arg = str(hop.get("arg") if hop.get("arg") is not None else "0")
+    with open(target, encoding="utf-8") as fh:
+        before = fh.read()
+    try:
+        res = apply_fix(before, line=cs.line, api=cs.api, arg=arg,
+                        sink=path["sink"], path_id=args.apply)
+    except ApplyError as e:
+        raise SystemExit(f"cannot apply {args.apply} to {rel}:{cs.line}: {e}")
+
+    shown = rel if os.path.isabs(rel) and os.path.relpath(rel).startswith("..") \
+        else os.path.relpath(rel) if os.path.isabs(rel) else rel
+    diff = res.diff(before, shown.lstrip("/"))
+    if not args.json:
+        if res.already_applied and not res.changed:
+            print(f"{rel}:{cs.line}: {res.wrapper} is already applied to {cs.api} argument {arg}; "
+                  f"nothing to change")
+        else:
+            print(diff, end="" if diff.endswith("\n") else "\n")
+        if res.constants_added:
+            print(f"# {', '.join(res.constants_added)}: placeholder value(s) — "
+                  f"fill in the {TODO_WORD} before relying on this")
+        if not res.wrapper_trusted:
+            print(f"# a {res.wrapper} is already defined in {rel} and was left alone; "
+                  "re-verification credits only VDB's exact wrapper (--patch prints it)")
+    if not args.write:
+        if args.json:
+            print(json.dumps({"path_id": args.apply, "file": rel, "line": cs.line,
+                              "written": False, **res.to_dict(), "diff": diff},
+                             indent=2, ensure_ascii=False))
+            return 0
+        print(f"# dry run: {rel} not written — add --write to apply and re-verify")
+        return 0
+
+    snapshot = None
+    if res.changed:
+        if not args.token:
+            # Keyless, the pre-edit code is what a later re-verification has
+            # to be given as --original — and after the write it exists
+            # nowhere else. Kept until the verification below succeeds.
+            snapshot = _snapshot(args.file)
+        with open(target, "w", encoding="utf-8") as fh:
+            fh.write(res.source)
+        if not args.json:
+            print(f"# wrote {shown}")
+    # Re-abstract what is on disk now; the verification is of the file, not
+    # of the string this process rewrote.
+    fixed = (build_ir_from_tree(args.file, exclude=tuple(args.exclude))
+             if os.path.isdir(args.file) else build_ir_from_file(args.file))
+    original_ir = None if args.token else payload["ir"]
+    try:
+        code, vout = _verify(base, {**payload, "ir": fixed.to_dict()}, args.apply, args.token,
+                             original_ir, json_out=args.json)
+    except SystemExit as e:
+        # A 429 or an outage after the write must not read as "the fix was
+        # not applied". Say what is on disk and how to finish.
+        how = (f"  vdb harden {args.file} --verify {args.apply} --original {snapshot}"
+               if snapshot else f"  vdb harden {args.file} --verify {args.apply}")
+        raise SystemExit(f"{e.code}\n{shown} was written but could not be re-verified; "
+                         f"when the API answers again:\n{how}")
+    if snapshot:
+        shutil.rmtree(os.path.dirname(snapshot), ignore_errors=True)
+    if args.json:
+        print(json.dumps({"path_id": args.apply, "file": rel, "line": cs.line,
+                          "written": res.changed, **res.to_dict(), "diff": diff,
+                          "verify": vout}, indent=2, ensure_ascii=False))
+    return code
+
+
+TODO_WORD = "TODO(vdb)"
+
+
+def _snapshot(path: str) -> str:
+    """A copy of the pre-edit file or tree in a fresh temp dir; the copy's path."""
+    from .ir import _SKIP_DIRS
+    tmp = tempfile.mkdtemp(prefix="vdb-apply-before-")
+    dst = os.path.join(tmp, os.path.basename(os.path.abspath(path)) or "tree")
+    if os.path.isdir(path):
+        shutil.copytree(path, dst, ignore=shutil.ignore_patterns(*_SKIP_DIRS, ".*"))
+    else:
+        shutil.copy2(path, dst)
+    return dst
+
+
 def _project_name(target: str, manifest: str) -> str:
     """The folder the user pointed at, or the one holding the lockfile.
 
@@ -725,6 +987,14 @@ def main(argv: list[str] | None = None) -> int:
                     help="with --verify and no API key: the pre-fix file or tree the path was "
                          "decided on (e.g. a `git worktree` of the previous commit). A key "
                          "binds the path to the stored analysis instead and signs the evidence.")
+    ap.add_argument("--apply", metavar="PATH_ID",
+                    help="place the synthesized fix for this path in your source: the "
+                         "wrapper function once per module, the call-site argument wrapped, "
+                         "values you must choose as VDB_* constants marked TODO(vdb). Prints "
+                         "a diff; nothing is written without --write")
+    ap.add_argument("--write", action="store_true",
+                    help="with --apply: write the file in place, then re-verify the path "
+                         "(keyless: the pre-edit code of this run is passed as the original)")
     ap.add_argument("--exclude", action="append", default=[], metavar="PATH",
                     help="leave a directory out of a tree analysis (relative path or glob, "
                          "repeatable): backups, vendored copies, benchmark fixtures")
@@ -764,8 +1034,10 @@ def main(argv: list[str] | None = None) -> int:
     if os.path.isdir(args.file):
         ir = build_ir_from_tree(args.file, exclude=tuple(args.exclude))
         if not ir.files:
-            raise SystemExit(f"no Python files under {args.file}")
+            _refuse_not_python(args, f"no Python files under {args.file}")
     else:
+        if os.path.splitext(args.file)[1].lower() in _FOREIGN_SOURCE_EXT:
+            _refuse_not_python(args, f"{args.file} is not a Python file")
         ir = build_ir_from_file(args.file)
 
     if args.emit_ir:
@@ -774,8 +1046,9 @@ def main(argv: list[str] | None = None) -> int:
 
     manifest = args.manifest or _find_manifest(args.file)
     if not manifest:
-        raise SystemExit("no dependency manifest found; pass --manifest "
-                         f"(looked for: {', '.join(_MANIFESTS)})")
+        _refuse_not_python(args, "no dependency manifest found; pass --manifest "
+                           f"(looked for: {', '.join(_MANIFESTS)})",
+                           only_with_manifest=True)
     with open(manifest, encoding="utf-8", errors="ignore") as fh:
         manifest_text = fh.read()
 
@@ -799,33 +1072,26 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         return _print_remediation(out, getattr(ir, "local_files", None) or {"": args.file})
 
+    if args.apply:
+        if args.write and args.verify:
+            raise SystemExit("--apply --write re-verifies on its own; drop --verify")
+        return _run_apply(args, ir, base, payload)
+
     if args.verify:
-        payload["path_id"] = args.verify
+        original_ir = None
         if args.original:
             if not os.path.exists(args.original):
                 raise SystemExit(f"no such file: {args.original}")
             if os.path.isdir(args.original):
-                payload["original_ir"] = build_ir_from_tree(
+                original_ir = build_ir_from_tree(
                     args.original, exclude=tuple(args.exclude)).to_dict()
             else:
-                payload["original_ir"] = build_ir_from_file(args.original).to_dict()
-        elif not args.token:
-            raise SystemExit(
-                "re-verification without an API key needs the pre-fix code too:\n"
-                "  vdb harden <fixed> --verify <path_id> --original <pre-fix file or tree>\n"
-                "(`git worktree add /tmp/before HEAD~1` gives you the tree). With a free "
-                "key (VDB_API_KEY) the path is bound to your stored analysis and the "
-                "evidence is signed.")
-        out = _post(f"{base}/v1/harden/verify", payload, args.token)
-        ev = out["evidence"]
-        mark = "CLOSED" if ev["closed"] else "OPEN"
-        print(f"path {ev['path_id']} -> {mark} ({ev['method']})")
-        print(f"  graph hash : {ev['graph_hash'][:16]}...")
-        print(f"  decided at : {ev['decided_at']}")
-        sig = ev.get("signature")
-        print(f"  signature  : {sig[:24] + '...' if sig else 'none (keyless — a free key signs the evidence)'}")
-        print(f"  note       : {out['note']}")
-        return 0 if ev["closed"] else 1
+                original_ir = build_ir_from_file(args.original).to_dict()
+        code, out = _verify(base, payload, args.verify, args.token, original_ir,
+                            json_out=args.json)
+        if args.json:
+            print(json.dumps(out, indent=2, ensure_ascii=False))
+        return code
 
     # 60s was the default for every call. A large project's first analysis
     # takes longer than that on the server, so the client gave up, the server

@@ -17,7 +17,7 @@ from . import __version__
 
 _USAGE = (
     "usage: vdb harden <file.py|dir> [--manifest <lock>] "
-    "[--patch|--rules|--emit-ir|--verify <path_id>|--vex|--json]\n"
+    "[--patch|--rules|--emit-ir|--verify <path_id>|--apply <path_id> [--write]|--vex|--json]\n"
     "       vdb harden --doctor\n"
     "       vdb --version\n"
 )
